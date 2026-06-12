@@ -62,7 +62,7 @@ class FakeStructuredModel:
 
 
 class FakeSlackClient:
-    def __init__(self):
+    def __init__(self, post_error=None):
         self.users = {
             "UME": "Ivan Rodriguez",
             "UOTHER": "Ana Gomez",
@@ -74,6 +74,7 @@ class FakeSlackClient:
         self.reply_calls = []
         self.replies_lookup = {}
         self.post_calls = []
+        self.post_error = post_error
 
     def users_info(self, user):
         return {
@@ -109,6 +110,8 @@ class FakeSlackClient:
 
     def chat_postMessage(self, **kwargs):
         self.post_calls.append(kwargs)
+        if self.post_error is not None:
+            raise self.post_error
         return {"ok": True, "ts": "50.123456"}
 
 
@@ -505,6 +508,16 @@ def test_custom_aliases_are_loaded_from_env(tmp_path):
     assert config.my_mention_aliases == ("ivan", "ivo", "ivo rodriguez")
 
 
+def test_reply_send_mode_defaults_to_safe_false(tmp_path):
+    config = make_config(tmp_path)
+    assert config.slack_send_approved_replies is False
+
+
+def test_reply_send_mode_can_be_enabled_from_env(tmp_path):
+    config = make_config(tmp_path, SLACK_SEND_APPROVED_REPLIES="true")
+    assert config.slack_send_approved_replies is True
+
+
 def test_atlassian_token_is_rejected_as_trello_api_key():
     error = validate_trello_api_key_format("ATATT3xFfGF0Zvzy-example-token")
     assert error is not None
@@ -661,9 +674,10 @@ def test_brief_handles_empty_task_list(tmp_path):
 
 
 def test_review_can_approve_existing_draft(tmp_path):
+    fake_slack = FakeSlackClient()
     app = AgentApp(
         make_config(tmp_path),
-        slack_client=FakeSlackClient(),
+        slack_client=fake_slack,
         structured_model_factory=lambda schema: FakeStructuredModel([]),
         input_fn=lambda prompt: "a",
         sleep_fn=lambda _: None,
@@ -696,6 +710,7 @@ def test_review_can_approve_existing_draft(tmp_path):
     assert task["status"] == "reply_approved"
     assert task["reply_approved_at"]
     assert task["manual_reply"] == "Lo reviso y te aviso."
+    assert fake_slack.post_calls == []
 
 
 def test_review_can_approve_and_send_reply_when_explicitly_enabled(tmp_path):
@@ -789,6 +804,99 @@ def test_approve_reply_can_send_existing_approved_reply_by_task_id(tmp_path):
     assert task["reply_sent_at"]
     assert task["reply_ts"] == "50.123456"
     assert fake_slack.post_calls[0]["text"] == "Respuesta ya aprobada."
+
+
+def test_approve_reply_records_slack_error_and_keeps_task_pending_send(tmp_path):
+    fake_slack = FakeSlackClient(post_error=RuntimeError("missing_scope"))
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="40.8",
+        summary="Responder a Lara",
+        requested_action="Confirmar revisión",
+        priority="medium",
+        category="communications",
+        classification=make_classification(
+            summary="Responder a Lara",
+            requested_action="Confirmar revisión",
+            category="communications",
+            draft_reply="Lo reviso y te aviso.",
+        ),
+    )
+
+    assert app.approve_reply(1, send=True) is False
+
+    with sqlite3.connect(app.config.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        task = conn.execute(
+            "SELECT status, reply_sent_at, reply_error, manual_reply FROM tasks LIMIT 1"
+        ).fetchone()
+        events = conn.execute(
+            "SELECT event_type FROM task_events WHERE task_id = 1 ORDER BY id ASC"
+        ).fetchall()
+
+    assert task["status"] == "reply_approved"
+    assert task["reply_sent_at"] is None
+    assert task["reply_error"] == "missing_scope"
+    assert task["manual_reply"] == "Lo reviso y te aviso."
+    assert fake_slack.post_calls[0]["thread_ts"] == "40.8"
+    assert [event["event_type"] for event in events] == ["reply_approved", "reply_failed"]
+
+
+def test_review_can_send_reply_when_enabled_from_env(tmp_path):
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(tmp_path, SLACK_SEND_APPROVED_REPLIES="true"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        input_fn=lambda prompt: "a",
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="40.9",
+        summary="Responder a Lara",
+        requested_action="Confirmar revisión",
+        priority="medium",
+        category="communications",
+        classification=make_classification(
+            summary="Responder a Lara",
+            requested_action="Confirmar revisión",
+            category="communications",
+            draft_reply="Lo reviso y te aviso.",
+        ),
+    )
+
+    reviewed = app.review_tasks(limit=1)
+
+    with sqlite3.connect(app.config.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        task = conn.execute(
+            "SELECT status, reply_sent_at, reply_ts FROM tasks LIMIT 1"
+        ).fetchone()
+
+    assert reviewed == 1
+    assert task["status"] == "responded"
+    assert task["reply_sent_at"]
+    assert task["reply_ts"] == "50.123456"
+    assert fake_slack.post_calls == [
+        {
+            "channel": "D40.9",
+            "thread_ts": "40.9",
+            "text": "Lo reviso y te aviso.",
+            "unfurl_links": False,
+            "unfurl_media": False,
+        }
+    ]
 
 
 def test_review_can_edit_open_trello_and_mark_done(tmp_path):
