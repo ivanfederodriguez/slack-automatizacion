@@ -30,6 +30,7 @@ from audio_transcription import (
     choose_audio_transcript,
     combine_text_and_audio,
     detect_audio_attachments,
+    detect_local_whisper_backend,
     format_audio_transcripts_for_message,
 )
 from trello_client import TrelloCard, TrelloCardState, TrelloClient, TrelloError, build_trello_token_url
@@ -50,7 +51,6 @@ DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 MAX_MESSAGE_LINKS = 5
 MAX_PUBLIC_PREVIEW_BYTES = 65536
-RECENT_CASE_WINDOW_HOURS = 2
 
 
 class ConfigError(RuntimeError):
@@ -270,6 +270,7 @@ class AgentConfig:
     poll_seconds: int = 300
     slack_sleep_seconds: float = 1.2
     include_self_for_test: bool = False
+    case_grouping_window_minutes: int = 15
     model_provider: Literal["ollama", "groq"] = DEFAULT_PROVIDER
     ollama_model: str = DEFAULT_OLLAMA_MODEL
     ollama_base_url: str = DEFAULT_OLLAMA_BASE_URL
@@ -303,6 +304,9 @@ class AgentConfig:
     local_whisper_cache_dir: str = "~/Library/Application Support/slack-personal-agent/audio"
     audio_transcript_fusion_enabled: bool = True
     audio_transcript_fusion_model: str = "main"
+    sync_worker_seconds: int = 60
+    sync_trello_done_enabled: bool = True
+    sync_telegram_poll_enabled: bool = True
     db_path: str = DB_PATH
 
     @classmethod
@@ -324,6 +328,10 @@ class AgentConfig:
 
         poll_seconds_raw = (get("POLL_SECONDS", "300") or "300").strip()
         sleep_seconds_raw = (get("SLACK_SLEEP_SECONDS", "1.2") or "1.2").strip()
+        case_grouping_window_minutes_raw = (
+            get("CASE_GROUPING_WINDOW_MINUTES", "15") or "15"
+        ).strip()
+        sync_worker_seconds_raw = (get("SYNC_WORKER_SECONDS", "60") or "60").strip()
 
         try:
             poll_seconds = int(poll_seconds_raw)
@@ -334,6 +342,20 @@ class AgentConfig:
             slack_sleep_seconds = float(sleep_seconds_raw)
         except ValueError as exc:
             raise ConfigError("SLACK_SLEEP_SECONDS debe ser un número.") from exc
+
+        try:
+            case_grouping_window_minutes = int(case_grouping_window_minutes_raw)
+        except ValueError as exc:
+            raise ConfigError("CASE_GROUPING_WINDOW_MINUTES debe ser un entero.") from exc
+        if case_grouping_window_minutes < 0:
+            raise ConfigError("CASE_GROUPING_WINDOW_MINUTES debe ser mayor o igual a 0.")
+
+        try:
+            sync_worker_seconds = int(sync_worker_seconds_raw)
+        except ValueError as exc:
+            raise ConfigError("SYNC_WORKER_SECONDS debe ser un entero.") from exc
+        if sync_worker_seconds <= 0:
+            raise ConfigError("SYNC_WORKER_SECONDS debe ser mayor a 0.")
 
         max_audio_seconds_raw = (get("LOCAL_WHISPER_MAX_SECONDS", "600") or "600").strip()
         try:
@@ -375,6 +397,7 @@ class AgentConfig:
             poll_seconds=poll_seconds,
             slack_sleep_seconds=slack_sleep_seconds,
             include_self_for_test=parse_bool(get("INCLUDE_SELF_FOR_TEST", "false") or "false"),
+            case_grouping_window_minutes=case_grouping_window_minutes,
             model_provider=model_provider,  # type: ignore[arg-type]
             ollama_model=(get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL) or DEFAULT_OLLAMA_MODEL).strip(),
             ollama_base_url=(get("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL) or DEFAULT_OLLAMA_BASE_URL).strip(),
@@ -416,6 +439,9 @@ class AgentConfig:
             ).strip(),
             audio_transcript_fusion_enabled=parse_bool(get("AUDIO_TRANSCRIPT_FUSION_ENABLED", "true") or "true"),
             audio_transcript_fusion_model=(get("AUDIO_TRANSCRIPT_FUSION_MODEL", "main") or "main").strip(),
+            sync_worker_seconds=sync_worker_seconds,
+            sync_trello_done_enabled=parse_bool(get("SYNC_TRELLO_DONE_ENABLED", "true") or "true"),
+            sync_telegram_poll_enabled=parse_bool(get("SYNC_TELEGRAM_POLL_ENABLED", "true") or "true"),
             db_path=(get("DB_PATH", DB_PATH) or DB_PATH).strip(),
         )
 
@@ -1946,6 +1972,10 @@ Reglas:
         channel_id = task_row["channel_id"] or ""
         return not channel_id.startswith("D")
 
+    def is_direct_message_conversation(self, conversation: dict[str, Any]) -> bool:
+        channel_id = str(conversation.get("id") or "")
+        return bool(conversation.get("is_im")) or channel_id.startswith("D")
+
     def requester_address(self, task_row: sqlite3.Row) -> str:
         requester_user_id = task_row["requester_user_id"] or task_row["user_id"] or ""
         if self.requester_needs_mention(task_row) and requester_user_id:
@@ -1991,11 +2021,39 @@ Reglas:
             if message.get("thread_ts"):
                 return None
 
+            requester_user_id = message.get("user") or ""
+            if self.config.case_grouping_window_minutes <= 0:
+                return None
+
+            recent_cutoff = (
+                datetime.now(timezone.utc)
+                - timedelta(minutes=self.config.case_grouping_window_minutes)
+            ).isoformat()
+            if self.is_direct_message_conversation(conversation) and requester_user_id:
+                recent_row = conn.execute(
+                    f"""
+                    SELECT tasks.*,
+                           processed_messages.raw_text,
+                           processed_messages.context_text
+                    FROM tasks
+                    LEFT JOIN processed_messages
+                      ON processed_messages.channel_id = tasks.channel_id
+                     AND processed_messages.message_ts = tasks.message_ts
+                    WHERE tasks.channel_id = ?
+                      AND COALESCE(tasks.status, 'new') IN ({placeholders})
+                      AND COALESCE(tasks.updated_at, tasks.created_at) >= ?
+                      AND COALESCE(tasks.requester_user_id, tasks.user_id, '') = ?
+                    ORDER BY COALESCE(tasks.updated_at, tasks.created_at) DESC, tasks.id DESC
+                    LIMIT 1
+                    """,
+                    (channel_id, *statuses, recent_cutoff, requester_user_id),
+                ).fetchone()
+                if recent_row and recent_row["message_ts"] != message.get("ts"):
+                    return recent_row
+
             if not self.looks_like_context_message(message.get("text", "")):
                 return None
 
-            requester_user_id = message.get("user") or ""
-            recent_cutoff = (datetime.now(timezone.utc) - timedelta(hours=RECENT_CASE_WINDOW_HOURS)).isoformat()
             recent_rows = conn.execute(
                 f"""
                 SELECT tasks.*,
@@ -3755,10 +3813,14 @@ Reglas:
         artifacts = install_launch_agents(
             project_dir=Path(__file__).resolve().parent,
             ollama_base_url=self.config.ollama_base_url,
+            sync_worker_seconds=self.config.sync_worker_seconds,
+            sync_trello_done_enabled=self.config.sync_trello_done_enabled,
+            sync_telegram_poll_enabled=self.config.sync_telegram_poll_enabled,
         )
         print("[green]Autostart instalado.[/green]")
         print(f"Ollama plist: {artifacts.ollama_plist}")
         print(f"Agente plist: {artifacts.agent_plist}")
+        print(f"Sync plist: {artifacts.sync_plist}")
         print(f"Logs: {artifacts.log_dir}")
 
     def uninstall_autostart(self) -> None:
@@ -3800,6 +3862,13 @@ Reglas:
             print(f"Workspace: {auth.get('team')}")
             print(f"Usuario: {auth.get('user')}")
             print(f"User ID: {auth.get('user_id')}")
+            print("[bold]Chequeo Slack escritura[/bold]")
+            print(
+                "[yellow]Los acuses automáticos, confirmaciones de contexto y respuestas aprobadas "
+                "usan chat.postMessage; el token necesita el scope chat:write o chat:write:bot. "
+                "Si Slack devuelve missing_scope con needed=chat:write:bot, reinstalá/actualizá "
+                "la app o el token con ese permiso.[/yellow]"
+            )
         except Exception as exc:
             ok = False
             print(f"[red]Slack auth falló:[/red] {exc}")
@@ -3834,6 +3903,24 @@ Reglas:
                     "[yellow]Si estás usando Ollama, verificá `ollama serve` y que el modelo "
                     f"`{self.config.ollama_model}` esté descargado.[/yellow]"
                 )
+
+        if self.config.local_whisper_enabled:
+            print("[bold]Chequeo Whisper local[/bold]")
+            whisper_backend = detect_local_whisper_backend()
+            if whisper_backend:
+                print(f"[green]Whisper local OK:[/green] {whisper_backend}")
+            else:
+                ok = False
+                print(
+                    "[red]LOCAL_WHISPER_ENABLED=true pero no encontré faster-whisper ni "
+                    "openai-whisper instalados.[/red]"
+                )
+                print(
+                    "[yellow]Instalá dependencias con `pip install -r requirements.txt` "
+                    "o desactivá LOCAL_WHISPER_ENABLED=false si solo querés usar transcripts de Slack.[/yellow]"
+                )
+        else:
+            print("[dim]Whisper local deshabilitado.[/dim]")
 
         if self.config.trello_enabled:
             print("[bold]Chequeo Trello[/bold]")

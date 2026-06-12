@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -107,6 +108,14 @@ class LocalWhisperTranscriber:
             kwargs["device"] = self.device
         self._model = whisper.load_model(self.model_name, **kwargs)
         self._backend = "openai_whisper"
+
+
+def detect_local_whisper_backend() -> str:
+    if importlib.util.find_spec("faster_whisper") is not None:
+        return "faster-whisper"
+    if importlib.util.find_spec("whisper") is not None:
+        return "openai-whisper"
+    return ""
 
 
 def clean_transcript_text(value: Any) -> str:

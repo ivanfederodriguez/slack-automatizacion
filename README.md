@@ -37,6 +37,7 @@ El CLI ya cubre una v0 util para uso personal:
 - Ollama local o Groq, segun `MODEL_PROVIDER`
 - Trello opcional
 - Telegram opcional para aprobacion privada
+- `faster-whisper` instalado si `LOCAL_WHISPER_ENABLED=true`
 
 El token de Slack que uses debe poder llamar, como minimo, a estos metodos que el codigo usa hoy:
 
@@ -46,6 +47,8 @@ El token de Slack que uses debe poder llamar, como minimo, a estos metodos que e
 - `conversations.history`
 - `conversations.replies`
 - `chat.postMessage`
+
+Para `chat.postMessage`, el scope esperado es `chat:write` o `chat:write:bot`, segun el tipo de token/app. `doctor` lo recuerda de forma explicita porque no hace un post de prueba para evitar mensajes visibles.
 
 Si `chat.postMessage` falla con algo como `missing_scope` o `not_allowed_token_type`, el agente deja auditado el error en `ack_error`, `context_ack_error` o `reply_error` segun el paso afectado, y no marca la tarea como respondida cuando se trata de una respuesta final.
 
@@ -84,6 +87,7 @@ GROQ_MODEL=openai/gpt-oss-20b
 POLL_SECONDS=300
 SLACK_SLEEP_SECONDS=1.2
 INCLUDE_SELF_FOR_TEST=false
+CASE_GROUPING_WINDOW_MINUTES=15
 SLACK_SEND_APPROVED_REPLIES=false
 
 # Trello opcional
@@ -104,6 +108,11 @@ TRELLO_DONE_LIST_NAMES=Hecho,Done
 TELEGRAM_ENABLED=false
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
+
+# Sync worker
+SYNC_WORKER_SECONDS=60
+SYNC_TRELLO_DONE_ENABLED=true
+SYNC_TELEGRAM_POLL_ENABLED=true
 
 # Audio opcional
 AUDIO_TRANSCRIPTION_ENABLED=true
@@ -127,6 +136,7 @@ Notas utiles:
 - el agente monitorea `private_channel`, `im` y `mpim`;
 - los canales publicos quedan fuera de alcance por ahora;
 - la base local por defecto es `slack_agent.db`;
+- en DMs, mensajes del mismo requester dentro de `CASE_GROUPING_WINDOW_MINUTES` se agrupan en el mismo caso aunque Slack no mande thread;
 - si `TRELLO_ENABLED=false`, todo el flujo principal sigue funcionando sin Trello;
 - si `TELEGRAM_ENABLED=false`, las tareas hechas quedan en `done_pending_reply` con error auditado hasta configurar Telegram o cerrarlas manualmente.
 
@@ -179,13 +189,31 @@ Si usas un chat 1:1 con el bot, el `chat_id` suele ser un entero positivo. Si us
 
 `python main.py trello-done-sync --limit 50`
 
-Chequea cards ya creadas en Trello y, si alguna paso a una lista marcada como hecha, mueve la tarea a `done_pending_reply` y dispara la notificacion de Telegram. Sirve para probar el flujo manualmente o para resincronizar si el loop no estuvo corriendo.
+Chequea cards ya creadas en Trello y, si alguna queda hecha segun `TRELLO_DONE_MODE`, mueve la tarea a `done_pending_reply` y dispara la notificacion de Telegram. Sirve para probar el flujo manualmente o para resincronizar si el loop no estuvo corriendo.
 
 `python main.py telegram-poll --limit 20`
 
 Lee comandos pendientes del bot de Telegram y procesa `/send`, `/edit` y `/nosend`. Es util para probar aprobaciones manualmente o para destrabar mensajes si queres correr Telegram por separado.
 
 Las respuestas finales no se envian automaticamente. El agente solo manda el mensaje final a Slack cuando Ivan usa `/send TASK_ID` o cuando se dispara un envio manual explicito por el flujo seguro existente.
+
+## Worker de sync
+
+`install-autostart` instala tres LaunchAgents:
+
+- `com.ivanrodriguez.slack-agent.ollama`, que corre `runtime/run_ollama.sh`;
+- `com.ivanrodriguez.slack-agent.agent`, que espera a Ollama y corre `python main.py poll`;
+- `com.ivanrodriguez.slack-agent.sync`, que corre `runtime/run_sync_worker.sh`.
+
+El worker de sync ejecuta en loop:
+
+```bash
+python main.py trello-done-sync --limit 50
+python main.py telegram-poll --limit 20
+sleep "$SYNC_WORKER_SECONDS"
+```
+
+Podés apagar una mitad del worker con `SYNC_TRELLO_DONE_ENABLED=false` o `SYNC_TELEGRAM_POLL_ENABLED=false`. Los logs quedan separados en `runtime/logs/sync.stdout.log` y `runtime/logs/sync.stderr.log`.
 
 ## Audio
 
@@ -194,6 +222,8 @@ Antes de clasificar un mensaje, el agente puede convertir audios de Slack en tex
 Si solo hay una transcripcion disponible, usa esa. Si no hay ninguna o falla la descarga/transcripcion, lo deja auditado en SQLite y no rompe el procesamiento. El agente no descarga audios cuando `LOCAL_WHISPER_ENABLED=false`, y no conserva archivos salvo que `LOCAL_WHISPER_KEEP_AUDIO_FILES=true`.
 
 Scopes utiles para audio en Slack: el token debe poder leer archivos privados, normalmente con `files:read` ademas de los scopes de conversaciones que ya usa el agente.
+
+Si `LOCAL_WHISPER_ENABLED=true`, `doctor` verifica que exista `faster-whisper` u `openai-whisper`. La instalacion recomendada es `pip install -r requirements.txt`, que ya incluye `faster-whisper`.
 
 Para probar Whisper local sin depender de Slack:
 

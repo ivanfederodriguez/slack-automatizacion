@@ -10,14 +10,17 @@ from pathlib import Path
 
 OLLAMA_LABEL = "com.ivanrodriguez.slack-agent.ollama"
 AGENT_LABEL = "com.ivanrodriguez.slack-agent.agent"
+SYNC_LABEL = "com.ivanrodriguez.slack-agent.sync"
 
 
 @dataclass(frozen=True)
 class LaunchArtifacts:
     ollama_plist: Path
     agent_plist: Path
+    sync_plist: Path
     ollama_script: Path
     agent_script: Path
+    sync_script: Path
     log_dir: Path
 
 
@@ -37,8 +40,10 @@ def build_launch_artifacts(project_dir: Path) -> LaunchArtifacts:
     return LaunchArtifacts(
         ollama_plist=launch_dir / f"{OLLAMA_LABEL}.plist",
         agent_plist=launch_dir / f"{AGENT_LABEL}.plist",
+        sync_plist=launch_dir / f"{SYNC_LABEL}.plist",
         ollama_script=support_dir / "run_ollama.sh",
         agent_script=support_dir / "run_agent.sh",
+        sync_script=support_dir / "run_sync_worker.sh",
         log_dir=log_dir,
     )
 
@@ -64,6 +69,41 @@ until curl -sf {shell_quote(ollama_base_url.rstrip('/'))}/api/tags >/dev/null 2>
 done
 
 exec {shell_quote(python_path)} {shell_quote(str(main_path))} poll
+"""
+
+
+def bool_env(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def build_sync_worker_script(
+    project_dir: Path,
+    python_path: str,
+    *,
+    sync_worker_seconds: int,
+    sync_trello_done_enabled: bool,
+    sync_telegram_poll_enabled: bool,
+) -> str:
+    main_path = project_dir / "main.py"
+    return f"""#!/bin/zsh
+set -euo pipefail
+cd {shell_quote(str(project_dir))}
+export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+export SYNC_WORKER_SECONDS={shell_quote(str(sync_worker_seconds))}
+export SYNC_TRELLO_DONE_ENABLED={shell_quote(bool_env(sync_trello_done_enabled))}
+export SYNC_TELEGRAM_POLL_ENABLED={shell_quote(bool_env(sync_telegram_poll_enabled))}
+
+while true; do
+  if [[ "$SYNC_TRELLO_DONE_ENABLED" == "true" ]]; then
+    {shell_quote(python_path)} {shell_quote(str(main_path))} trello-done-sync --limit 50 || echo "trello-done-sync failed with $?"
+  fi
+
+  if [[ "$SYNC_TELEGRAM_POLL_ENABLED" == "true" ]]; then
+    {shell_quote(python_path)} {shell_quote(str(main_path))} telegram-poll --limit 20 || echo "telegram-poll failed with $?"
+  fi
+
+  sleep "$SYNC_WORKER_SECONDS"
+done
 """
 
 
@@ -94,7 +134,14 @@ def write_launchd_plist(
     }
 
 
-def install_launch_agents(project_dir: Path, ollama_base_url: str) -> LaunchArtifacts:
+def install_launch_agents(
+    project_dir: Path,
+    ollama_base_url: str,
+    *,
+    sync_worker_seconds: int = 60,
+    sync_trello_done_enabled: bool = True,
+    sync_telegram_poll_enabled: bool = True,
+) -> LaunchArtifacts:
     ollama_path = shutil.which("ollama")
     if not ollama_path:
         raise RuntimeError("No encontré `ollama` en PATH.")
@@ -108,8 +155,19 @@ def install_launch_agents(project_dir: Path, ollama_base_url: str) -> LaunchArti
 
     artifacts.ollama_script.write_text(build_ollama_script(project_dir, ollama_path), encoding="utf-8")
     artifacts.agent_script.write_text(build_agent_script(project_dir, python_path, ollama_base_url), encoding="utf-8")
+    artifacts.sync_script.write_text(
+        build_sync_worker_script(
+            project_dir,
+            python_path,
+            sync_worker_seconds=sync_worker_seconds,
+            sync_trello_done_enabled=sync_trello_done_enabled,
+            sync_telegram_poll_enabled=sync_telegram_poll_enabled,
+        ),
+        encoding="utf-8",
+    )
     ensure_executable(artifacts.ollama_script)
     ensure_executable(artifacts.agent_script)
+    ensure_executable(artifacts.sync_script)
 
     ollama_plist = write_launchd_plist(
         label=OLLAMA_LABEL,
@@ -127,14 +185,23 @@ def install_launch_agents(project_dir: Path, ollama_base_url: str) -> LaunchArti
         working_directory=launch_working_directory,
         keep_alive=True,
     )
+    sync_plist = write_launchd_plist(
+        label=SYNC_LABEL,
+        program_arguments=["/bin/zsh", str(artifacts.sync_script)],
+        stdout_path=artifacts.log_dir / "sync.stdout.log",
+        stderr_path=artifacts.log_dir / "sync.stderr.log",
+        working_directory=launch_working_directory,
+        keep_alive=True,
+    )
 
     artifacts.ollama_plist.write_bytes(plistlib.dumps(ollama_plist))
     artifacts.agent_plist.write_bytes(plistlib.dumps(agent_plist))
+    artifacts.sync_plist.write_bytes(plistlib.dumps(sync_plist))
 
     uid = os.getuid()
-    for plist in (artifacts.agent_plist, artifacts.ollama_plist):
+    for plist in (artifacts.sync_plist, artifacts.agent_plist, artifacts.ollama_plist):
         subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(plist)], check=False)
-    for plist in (artifacts.ollama_plist, artifacts.agent_plist):
+    for plist in (artifacts.ollama_plist, artifacts.agent_plist, artifacts.sync_plist):
         subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)], check=True)
 
     return artifacts
@@ -143,7 +210,7 @@ def install_launch_agents(project_dir: Path, ollama_base_url: str) -> LaunchArti
 def uninstall_launch_agents(project_dir: Path) -> LaunchArtifacts:
     artifacts = build_launch_artifacts(project_dir)
     uid = os.getuid()
-    for plist in (artifacts.agent_plist, artifacts.ollama_plist):
+    for plist in (artifacts.sync_plist, artifacts.agent_plist, artifacts.ollama_plist):
         if plist.exists():
             subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(plist)], check=False)
             plist.unlink(missing_ok=True)

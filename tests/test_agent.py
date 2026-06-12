@@ -1,6 +1,7 @@
 import sqlite3
 from datetime import datetime, timezone
 
+import slack_personal_agent
 from main import build_parser
 import trello_client
 from trello_client import TrelloCard, TrelloCardState, TrelloClient
@@ -183,6 +184,10 @@ class FakeAudioTranscriber:
         if self.responses:
             return self.responses.pop(0)
         return "Transcripción local de prueba."
+
+
+class DoctorResult:
+    summary = "Proveedor listo."
 
 
 def get_processed_row(db_path):
@@ -457,6 +462,46 @@ def test_thread_context_updates_existing_task_without_duplicate_and_confirms(tmp
     assert len(context_events) == 1
     assert fake_trello.comments[0]["card_id"] == "card123"
     assert "reporte de mayo" in fake_trello.comments[0]["text"]
+
+
+def test_consecutive_dm_messages_from_same_sender_group_into_one_task(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(tmp_path, CASE_GROUPING_WINDOW_MINUTES="15"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    conversation = {"id": "D123", "is_im": True, "user": "UOTHER"}
+
+    app.process_message(
+        {"ts": "1.55", "text": "Revisás este reporte?", "user": "UOTHER"},
+        conversation,
+        my_user_id="UME",
+    )
+    app.process_message(
+        {"ts": "1.56", "text": "La versión buena es la de junio.", "user": "UOTHER"},
+        conversation,
+        my_user_id="UME",
+    )
+
+    with sqlite3.connect(app.config.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        second_message = conn.execute(
+            "SELECT classification_status FROM processed_messages WHERE message_ts = '1.56'"
+        ).fetchone()
+        context_events = conn.execute(
+            "SELECT details_json FROM task_events WHERE event_type = 'context_added'"
+        ).fetchall()
+
+    assert count_tasks(app.config.db_path) == 1
+    assert len(fake_model.calls) == 1
+    assert second_message["classification_status"] == "context_added"
+    assert len(context_events) == 1
+    assert "La versión buena" in context_events[0]["details_json"]
+    assert "Buenísimo, gracias" in fake_slack.post_calls[1]["text"]
 
 
 def test_duplicate_thread_context_does_not_send_confirmation(tmp_path):
@@ -757,6 +802,34 @@ def test_audio_download_failure_is_audited_and_does_not_break(tmp_path):
     processed = get_processed_row(app.config.db_path)
     assert row["transcription_status"] == "failed"
     assert row["transcription_error"] == "download failed"
+    assert processed["classification_status"] == "ignored"
+    assert count_tasks(app.config.db_path) == 0
+
+
+def test_audio_missing_local_whisper_dependency_is_audited_and_does_not_break(tmp_path):
+    fake_model = FakeStructuredModel([])
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        audio_transcriber=FakeAudioTranscriber(
+            error=RuntimeError("Falta instalar `faster-whisper` u `openai-whisper`.")
+        ),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    app.download_audio_attachment = lambda attachment: tmp_path / "audio.m4a"
+
+    app.process_message(
+        {"ts": "2.95", "text": "", "user": "UOTHER", "files": [audio_file()]},
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    row = get_audio_rows(app.config.db_path)[0]
+    processed = get_processed_row(app.config.db_path)
+    assert row["transcription_status"] == "failed"
+    assert "faster-whisper" in row["transcription_error"]
     assert processed["classification_status"] == "ignored"
     assert count_tasks(app.config.db_path) == 0
 
@@ -1589,6 +1662,46 @@ def test_reply_send_mode_defaults_to_safe_false(tmp_path):
 def test_reply_send_mode_can_be_enabled_from_env(tmp_path):
     config = make_config(tmp_path, SLACK_SEND_APPROVED_REPLIES="true")
     assert config.slack_send_approved_replies is True
+
+
+def test_case_grouping_and_sync_worker_config_defaults(tmp_path):
+    config = make_config(tmp_path)
+    assert config.case_grouping_window_minutes == 15
+    assert config.sync_worker_seconds == 60
+    assert config.sync_trello_done_enabled is True
+    assert config.sync_telegram_poll_enabled is True
+
+
+def test_doctor_warns_about_slack_chat_write_scope(tmp_path, capsys):
+    app = AgentApp(
+        make_config(tmp_path, LOCAL_WHISPER_ENABLED="false"),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([DoctorResult()]),
+        sleep_fn=lambda _: None,
+    )
+
+    assert app.doctor() is True
+
+    output = capsys.readouterr().out
+    assert "chat.postMessage" in output
+    assert "chat:write" in output
+    assert "chat:write:bot" in output
+
+
+def test_doctor_warns_when_local_whisper_enabled_without_backend(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(slack_personal_agent, "detect_local_whisper_backend", lambda: "")
+    app = AgentApp(
+        make_config(tmp_path, LOCAL_WHISPER_ENABLED="true"),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([DoctorResult()]),
+        sleep_fn=lambda _: None,
+    )
+
+    assert app.doctor() is False
+
+    output = capsys.readouterr().out
+    assert "LOCAL_WHISPER_ENABLED=true" in output
+    assert "faster-whisper" in output
 
 
 def test_atlassian_token_is_rejected_as_trello_api_key():
