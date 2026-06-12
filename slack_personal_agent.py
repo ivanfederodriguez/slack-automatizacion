@@ -22,7 +22,7 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from autostart import install_launch_agents, uninstall_launch_agents
-from trello_client import TrelloCard, TrelloClient, TrelloError, build_trello_token_url
+from trello_client import TrelloCard, TrelloCardState, TrelloClient, TrelloError, build_trello_token_url
 from url_enrichment import (
     MessageLink,
     classify_url,
@@ -40,10 +40,63 @@ DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 MAX_MESSAGE_LINKS = 5
 MAX_PUBLIC_PREVIEW_BYTES = 65536
+RECENT_CASE_WINDOW_HOURS = 2
 
 
 class ConfigError(RuntimeError):
     """Raised when required configuration is missing or invalid."""
+
+
+class TelegramError(RuntimeError):
+    """Raised when Telegram API operations fail."""
+
+
+class TelegramClient:
+    def __init__(self, bot_token: str, chat_id: str, timeout: int = 30) -> None:
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.timeout = timeout
+
+    @property
+    def api_base(self) -> str:
+        return f"https://api.telegram.org/bot{self.bot_token}"
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        response = requests.request(
+            method,
+            f"{self.api_base}{path}",
+            timeout=self.timeout,
+            **kwargs,
+        )
+        if response.status_code >= 400:
+            raise TelegramError(f"Telegram devolvió {response.status_code}: {response.text[:500]}")
+        payload = response.json()
+        if not payload.get("ok"):
+            raise TelegramError(str(payload.get("description") or "Telegram respondió ok=false."))
+        return payload
+
+    def send_message(self, text: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/sendMessage",
+            json={
+                "chat_id": self.chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            },
+        )
+
+    def get_updates(self, offset: Optional[int] = None, limit: int = 20) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            "/getUpdates",
+            params={
+                "offset": offset,
+                "limit": limit,
+                "timeout": 0,
+            },
+        )
+        return list(payload.get("result") or [])
 
 
 class SlackClassification(BaseModel):
@@ -109,6 +162,20 @@ class TrelloClientProtocol(Protocol):
         member_ids: Optional[list[str]] = None,
         label_ids: Optional[list[str]] = None,
     ) -> TrelloCard:
+        ...
+
+    def get_card(self, card_id: str) -> TrelloCardState:
+        ...
+
+    def add_card_comment(self, card_id: str, text: str) -> None:
+        ...
+
+
+class TelegramClientProtocol(Protocol):
+    def send_message(self, text: str) -> Any:
+        ...
+
+    def get_updates(self, offset: Optional[int] = None, limit: int = 20) -> list[dict[str, Any]]:
         ...
 
 
@@ -203,6 +270,11 @@ class AgentConfig:
     trello_member_ids: tuple[str, ...] = ()
     trello_label_ids: tuple[str, ...] = ()
     trello_card_position: str = "top"
+    trello_done_list_id: str = ""
+    trello_done_list_names: tuple[str, ...] = ("hecho", "done")
+    telegram_enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
     db_path: str = DB_PATH
 
     @classmethod
@@ -252,6 +324,11 @@ class AgentConfig:
             for label_id in (get("TRELLO_LABEL_IDS", "") or "").split(",")
             if label_id.strip()
         )
+        trello_done_list_names = tuple(
+            normalize_for_matching(name)
+            for name in (get("TRELLO_DONE_LIST_NAMES", "Hecho,Done") or "Hecho,Done").split(",")
+            if normalize_for_matching(name)
+        )
 
         return cls(
             slack_user_token=slack_user_token,
@@ -274,6 +351,11 @@ class AgentConfig:
             trello_member_ids=trello_member_ids,
             trello_label_ids=trello_label_ids,
             trello_card_position=(get("TRELLO_CARD_POSITION", "top") or "top").strip(),
+            trello_done_list_id=(get("TRELLO_DONE_LIST_ID", "") or "").strip(),
+            trello_done_list_names=trello_done_list_names or ("hecho", "done"),
+            telegram_enabled=parse_bool(get("TELEGRAM_ENABLED", "false") or "false"),
+            telegram_bot_token=(get("TELEGRAM_BOT_TOKEN", "") or "").strip(),
+            telegram_chat_id=(get("TELEGRAM_CHAT_ID", "") or "").strip(),
             db_path=(get("DB_PATH", DB_PATH) or DB_PATH).strip(),
         )
 
@@ -339,6 +421,7 @@ class AgentApp:
         slack_client: Optional[WebClient] = None,
         structured_model_factory: Optional[Callable[[type[BaseModel]], StructuredModel]] = None,
         trello_client: Optional[TrelloClientProtocol] = None,
+        telegram_client: Optional[TelegramClientProtocol] = None,
         public_preview_fetcher: Optional[PublicPreviewFetcher] = None,
         input_fn: Callable[[str], str] = input,
         open_url_fn: Callable[[str], bool] = webbrowser.open,
@@ -348,6 +431,7 @@ class AgentApp:
         self.slack = slack_client or WebClient(token=config.slack_user_token)
         self._structured_model_factory = structured_model_factory or self._build_structured_model
         self._trello_client = trello_client
+        self._telegram_client = telegram_client
         self._public_preview_fetcher = public_preview_fetcher or self.fetch_public_url_preview
         self._input = input_fn
         self._open_url = open_url_fn
@@ -460,6 +544,64 @@ class AgentApp:
             self._ensure_column(conn, "tasks", "reply_ts", "reply_ts TEXT")
             self._ensure_column(conn, "tasks", "reply_error", "reply_error TEXT")
             self._ensure_column(conn, "tasks", "manual_reply", "manual_reply TEXT")
+            self._ensure_column(conn, "tasks", "updated_at", "updated_at TEXT")
+            self._ensure_column(conn, "tasks", "case_key", "case_key TEXT")
+            self._ensure_column(conn, "tasks", "requester_user_id", "requester_user_id TEXT")
+            self._ensure_column(conn, "tasks", "requester_label", "requester_label TEXT")
+            self._ensure_column(conn, "tasks", "thread_ts", "thread_ts TEXT")
+            self._ensure_column(conn, "tasks", "acknowledged_at", "acknowledged_at TEXT")
+            self._ensure_column(conn, "tasks", "last_context_ack_at", "last_context_ack_at TEXT")
+            self._ensure_column(conn, "tasks", "done_pending_reply_at", "done_pending_reply_at TEXT")
+            self._ensure_column(conn, "tasks", "final_reply_suggestion", "final_reply_suggestion TEXT")
+            self._ensure_column(conn, "tasks", "ack_error", "ack_error TEXT")
+            self._ensure_column(conn, "tasks", "context_ack_error", "context_ack_error TEXT")
+            self._ensure_column(conn, "tasks", "telegram_notified_at", "telegram_notified_at TEXT")
+            self._ensure_column(conn, "tasks", "telegram_error", "telegram_error TEXT")
+
+            conn.execute(
+                """
+                UPDATE tasks
+                SET thread_ts = message_ts
+                WHERE thread_ts IS NULL OR thread_ts = ''
+                """
+            )
+            conn.execute(
+                """
+                UPDATE tasks
+                SET case_key = channel_id || ':' || COALESCE(NULLIF(thread_ts, ''), message_ts)
+                WHERE case_key IS NULL OR case_key = ''
+                """
+            )
+            conn.execute(
+                """
+                UPDATE tasks
+                SET requester_user_id = user_id
+                WHERE requester_user_id IS NULL OR requester_user_id = ''
+                """
+            )
+            conn.execute(
+                """
+                UPDATE tasks
+                SET requester_label = sender_label
+                WHERE requester_label IS NULL OR requester_label = ''
+                """
+            )
+            conn.execute(
+                """
+                UPDATE tasks
+                SET updated_at = created_at
+                WHERE updated_at IS NULL OR updated_at = ''
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
 
             conn.execute(
                 """
@@ -498,6 +640,18 @@ class AgentApp:
                 ON task_events(task_id, created_at)
                 """
             )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_tasks_case_key
+                ON tasks(case_key)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_tasks_trello_card_id
+                ON tasks(trello_card_id)
+                """
+            )
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column_name: str, definition: str) -> None:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -517,6 +671,25 @@ class AgentApp:
                     event_type,
                     json.dumps(details or {}, ensure_ascii=False, sort_keys=True),
                 ),
+            )
+
+    def get_agent_state(self, key: str) -> Optional[str]:
+        with self.db_connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM agent_state WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return row["value"] if row else None
+
+    def set_agent_state(self, key: str, value: str) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO agent_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
             )
 
     def _build_structured_model(self, schema: type[BaseModel]) -> StructuredModel:
@@ -587,6 +760,19 @@ class AgentApp:
                 token=self.config.trello_token,
             )
         return self._trello_client
+
+    def has_telegram_config(self) -> bool:
+        return bool(self.config.telegram_bot_token and self.config.telegram_chat_id)
+
+    def get_telegram_client(self) -> TelegramClientProtocol:
+        if self._telegram_client is None:
+            if not self.has_telegram_config():
+                raise TelegramError("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
+            self._telegram_client = TelegramClient(
+                bot_token=self.config.telegram_bot_token,
+                chat_id=self.config.telegram_chat_id,
+            )
+        return self._telegram_client
 
     def slack_call(self, method: Callable[..., Any], **kwargs: Any) -> Any:
         while True:
@@ -822,20 +1008,28 @@ class AgentApp:
         *,
         channel_id: str,
         message_ts: str,
+        thread_ts: str,
+        case_key: str,
         user_id: Optional[str],
         sender_label: str,
         conversation_label: str,
         classification: SlackClassification,
     ) -> bool:
+        timestamp = now_iso()
         with self.db_connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO tasks (
                     created_at,
+                    updated_at,
                     channel_id,
                     message_ts,
+                    thread_ts,
+                    case_key,
                     user_id,
+                    requester_user_id,
                     sender_label,
+                    requester_label,
                     conversation_label,
                     summary,
                     requested_action,
@@ -845,13 +1039,18 @@ class AgentApp:
                     trello_status,
                     classification_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    now_iso(),
+                    timestamp,
+                    timestamp,
                     channel_id,
                     message_ts,
+                    thread_ts,
+                    case_key,
                     user_id,
+                    user_id,
+                    sender_label,
                     sender_label,
                     conversation_label,
                     classification.summary,
@@ -864,6 +1063,293 @@ class AgentApp:
                 ),
             )
         return cursor.rowcount > 0
+
+    def mark_processed_context_status(
+        self,
+        *,
+        channel_id: str,
+        message_ts: str,
+        status: str,
+        reason: str,
+    ) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE processed_messages
+                SET updated_at = ?,
+                    classification_status = ?,
+                    relevance_reason = ?,
+                    classification_error = NULL
+                WHERE channel_id = ? AND message_ts = ?
+                """,
+                (
+                    now_iso(),
+                    status,
+                    reason,
+                    channel_id,
+                    message_ts,
+                ),
+            )
+
+    def normalized_context_fingerprint(self, text: str) -> str:
+        normalized = normalize_for_matching(text)
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip()
+
+    def existing_context_fingerprints(self, task_id: int) -> set[str]:
+        with self.db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT details_json
+                FROM task_events
+                WHERE task_id = ?
+                  AND event_type = 'context_added'
+                """,
+                (task_id,),
+            ).fetchall()
+
+        fingerprints: set[str] = set()
+        for row in rows:
+            try:
+                details = json.loads(row["details_json"] or "{}")
+            except json.JSONDecodeError:
+                details = {}
+            fingerprint = self.normalized_context_fingerprint(details.get("text") or "")
+            if fingerprint:
+                fingerprints.add(fingerprint)
+        return fingerprints
+
+    def message_adds_new_context(self, task_row: sqlite3.Row, text: str) -> bool:
+        fingerprint = self.normalized_context_fingerprint(text)
+        if not fingerprint:
+            return False
+
+        original = self.normalized_context_fingerprint(task_row["raw_text"] or "")
+        if fingerprint == original:
+            return False
+
+        if fingerprint in self.existing_context_fingerprints(task_row["id"]):
+            return False
+
+        return True
+
+    def mark_task_acknowledged(self, task_id: int) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET acknowledged_at = ?,
+                    ack_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now_iso(), now_iso(), task_id),
+            )
+        self.record_task_event(task_id, "slack_ack_sent", {})
+
+    def mark_task_ack_failed(self, task_id: int, error_message: str) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET ack_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (error_message[:1000], now_iso(), task_id),
+            )
+        self.record_task_event(task_id, "slack_ack_failed", {"error": error_message[:1000]})
+
+    def mark_task_context_acknowledged(self, task_id: int) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET last_context_ack_at = ?,
+                    context_ack_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now_iso(), now_iso(), task_id),
+            )
+        self.record_task_event(task_id, "slack_context_ack_sent", {})
+
+    def mark_task_context_ack_failed(self, task_id: int, error_message: str) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET context_ack_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (error_message[:1000], now_iso(), task_id),
+            )
+        self.record_task_event(task_id, "slack_context_ack_failed", {"error": error_message[:1000]})
+
+    def send_task_acknowledgement(self, task_id: int) -> bool:
+        task_row = self.get_task_by_id(task_id)
+        if not task_row:
+            return False
+
+        mention = ""
+        requester_user_id = task_row["requester_user_id"] or task_row["user_id"] or ""
+        if self.requester_needs_mention(task_row) and requester_user_id:
+            mention = f"<@{requester_user_id}> "
+        text = (
+            f"{mention}Dale, lo tomo. Lo registré como: "
+            f"‘{compact_text(task_row['summary'] or 'el pedido', 180)}’. "
+            "Si querés, podés agregar contexto en este mismo hilo."
+        )
+        try:
+            self.slack_call(
+                self.slack.chat_postMessage,
+                channel=task_row["channel_id"],
+                thread_ts=task_row["thread_ts"] or task_row["message_ts"],
+                text=text,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+        except Exception as exc:
+            self.mark_task_ack_failed(task_id, str(exc))
+            print(f"[yellow]No pude enviar acuse de recibo Slack para tarea #{task_id}: {exc}[/yellow]")
+            return False
+
+        self.mark_task_acknowledged(task_id)
+        return True
+
+    def send_context_acknowledgement(self, task_id: int, summary: str) -> bool:
+        task_row = self.get_task_by_id(task_id)
+        if not task_row:
+            return False
+
+        text = (
+            "Buenísimo, gracias. Lo sumo al pedido. "
+            f"El registro queda como: ‘{compact_text(summary or 'el pedido', 180)}’."
+        )
+        try:
+            self.slack_call(
+                self.slack.chat_postMessage,
+                channel=task_row["channel_id"],
+                thread_ts=task_row["thread_ts"] or task_row["message_ts"],
+                text=text,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+        except Exception as exc:
+            self.mark_task_context_ack_failed(task_id, str(exc))
+            print(f"[yellow]No pude confirmar contexto Slack para tarea #{task_id}: {exc}[/yellow]")
+            return False
+
+        self.mark_task_context_acknowledged(task_id)
+        return True
+
+    def mark_task_trello_context_failed(self, task_id: int, error_message: str) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET trello_last_error = ?,
+                    trello_synced_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (error_message[:1000], now_iso(), now_iso(), task_id),
+            )
+        self.record_task_event(task_id, "trello_context_failed", {"error": error_message[:1000]})
+
+    def add_context_to_trello_card(self, task_row: sqlite3.Row, text: str, sender_label: str) -> None:
+        card_id = task_row["trello_card_id"] or ""
+        if not card_id:
+            return
+
+        comment = "\n".join(
+            [
+                "Contexto agregado desde Slack:",
+                "",
+                f"{sender_label}: {text.strip()}",
+            ]
+        )
+        try:
+            self.get_trello_client().add_card_comment(card_id, comment)
+        except Exception as exc:
+            self.mark_task_trello_context_failed(task_row["id"], str(exc))
+            print(f"[yellow]No pude agregar contexto en Trello para tarea #{task_row['id']}: {exc}[/yellow]")
+            return
+
+        self.record_task_event(task_row["id"], "trello_context_added", {"card_id": card_id})
+
+    def add_context_to_task(
+        self,
+        task_row: sqlite3.Row,
+        *,
+        message: dict[str, Any],
+        conversation: dict[str, Any],
+        sender_label: str,
+        conversation_label: str,
+    ) -> bool:
+        text = (message.get("text") or "").strip()
+        context_text = ""
+        try:
+            context_text = self.fetch_recent_context(conversation["id"], message["ts"])
+        except Exception:
+            context_text = ""
+
+        links = [self.enrich_message_link(link) for link in self.extract_message_links(text)]
+        self.upsert_processed_relevance(
+            channel_id=conversation["id"],
+            message_ts=message["ts"],
+            user_id=message.get("user"),
+            sender_label=sender_label,
+            conversation_label=conversation_label,
+            raw_text=text,
+            relevant=True,
+            relevance_reason=f"Contexto para tarea existente #{task_row['id']}.",
+            context_text=context_text,
+        )
+        self.replace_message_links(conversation["id"], message["ts"], links)
+
+        if not self.message_adds_new_context(task_row, text):
+            self.mark_processed_context_status(
+                channel_id=conversation["id"],
+                message_ts=message["ts"],
+                status="context_duplicate",
+                reason=f"No aporta contexto nuevo para tarea #{task_row['id']}.",
+            )
+            return False
+
+        summary = task_row["summary"] or "el pedido"
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET updated_at = ?,
+                    status = CASE WHEN status = 'snoozed' THEN 'new' ELSE status END,
+                    snoozed_until = CASE WHEN status = 'snoozed' THEN NULL ELSE snoozed_until END
+                WHERE id = ?
+                """,
+                (now_iso(), task_row["id"]),
+            )
+
+        self.record_task_event(
+            task_row["id"],
+            "context_added",
+            {
+                "channel_id": conversation["id"],
+                "message_ts": message["ts"],
+                "sender_label": sender_label,
+                "text": text,
+            },
+        )
+        self.add_context_to_trello_card(task_row, text, sender_label)
+        self.mark_processed_context_status(
+            channel_id=conversation["id"],
+            message_ts=message["ts"],
+            status="context_added",
+            reason=f"Contexto agregado a tarea #{task_row['id']}.",
+        )
+        self.send_context_acknowledgement(task_row["id"], summary)
+        return True
 
     def extract_message_links(self, text: str) -> list[MessageLink]:
         links: list[MessageLink] = []
@@ -1095,6 +1581,32 @@ class AgentApp:
             )
         return format_links_for_prompt(links)
 
+    def task_context_additions_text(self, task_id: int, limit: int = 8) -> str:
+        with self.db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT created_at, details_json
+                FROM task_events
+                WHERE task_id = ?
+                  AND event_type = 'context_added'
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (task_id, limit),
+            ).fetchall()
+
+        lines = []
+        for row in rows:
+            try:
+                details = json.loads(row["details_json"] or "{}")
+            except json.JSONDecodeError:
+                details = {}
+            sender = details.get("sender_label") or "unknown"
+            text = compact_text(details.get("text") or "", 500)
+            if text:
+                lines.append(f"- {sender}: {text}")
+        return "\n".join(lines)
+
     def message_mentions_me(self, text: str, my_user_id: str) -> bool:
         if f"<@{my_user_id}>" in text:
             return True
@@ -1104,6 +1616,122 @@ class AgentApp:
             if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", normalized_text):
                 return True
         return False
+
+    def message_thread_ts(self, message: dict[str, Any]) -> str:
+        return str(message.get("thread_ts") or message.get("ts") or "")
+
+    def build_case_key(self, channel_id: str, thread_ts: str) -> str:
+        return f"{channel_id}:{thread_ts}"
+
+    def open_task_statuses_sql(self) -> tuple[str, ...]:
+        return (
+            "new",
+            "snoozed",
+            "reply_approved",
+            "done_pending_reply",
+        )
+
+    def requester_needs_mention(self, task_row: sqlite3.Row) -> bool:
+        channel_id = task_row["channel_id"] or ""
+        return not channel_id.startswith("D")
+
+    def requester_address(self, task_row: sqlite3.Row) -> str:
+        requester_user_id = task_row["requester_user_id"] or task_row["user_id"] or ""
+        if self.requester_needs_mention(task_row) and requester_user_id:
+            return f"<@{requester_user_id}>"
+        requester_label = task_row["requester_label"] or task_row["sender_label"] or ""
+        first_name = requester_label.split()[0] if requester_label else ""
+        return first_name or "Hola"
+
+    def find_existing_case_for_message(
+        self,
+        message: dict[str, Any],
+        conversation: dict[str, Any],
+        sender_label: str,
+    ) -> Optional[sqlite3.Row]:
+        channel_id = conversation["id"]
+        thread_ts = self.message_thread_ts(message)
+        if not thread_ts:
+            return None
+
+        statuses = self.open_task_statuses_sql()
+        placeholders = ", ".join("?" for _ in statuses)
+        with self.db_connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT tasks.*,
+                       processed_messages.raw_text,
+                       processed_messages.context_text
+                FROM tasks
+                LEFT JOIN processed_messages
+                  ON processed_messages.channel_id = tasks.channel_id
+                 AND processed_messages.message_ts = tasks.message_ts
+                WHERE tasks.channel_id = ?
+                  AND COALESCE(tasks.thread_ts, tasks.message_ts) = ?
+                  AND COALESCE(tasks.status, 'new') IN ({placeholders})
+                ORDER BY tasks.id DESC
+                LIMIT 1
+                """,
+                (channel_id, thread_ts, *statuses),
+            ).fetchone()
+            if row and row["message_ts"] != message.get("ts"):
+                return row
+
+            if message.get("thread_ts"):
+                return None
+
+            if not self.looks_like_context_message(message.get("text", "")):
+                return None
+
+            requester_user_id = message.get("user") or ""
+            recent_cutoff = (datetime.now(timezone.utc) - timedelta(hours=RECENT_CASE_WINDOW_HOURS)).isoformat()
+            recent_rows = conn.execute(
+                f"""
+                SELECT tasks.*,
+                       processed_messages.raw_text,
+                       processed_messages.context_text
+                FROM tasks
+                LEFT JOIN processed_messages
+                  ON processed_messages.channel_id = tasks.channel_id
+                 AND processed_messages.message_ts = tasks.message_ts
+                WHERE tasks.channel_id = ?
+                  AND COALESCE(tasks.status, 'new') IN ({placeholders})
+                  AND COALESCE(tasks.updated_at, tasks.created_at) >= ?
+                  AND (
+                    COALESCE(tasks.requester_user_id, tasks.user_id, '') = ?
+                    OR COALESCE(tasks.requester_label, tasks.sender_label, '') = ?
+                  )
+                ORDER BY COALESCE(tasks.updated_at, tasks.created_at) DESC, tasks.id DESC
+                LIMIT 2
+                """,
+                (channel_id, *statuses, recent_cutoff, requester_user_id, sender_label),
+            ).fetchall()
+
+        if len(recent_rows) == 1 and recent_rows[0]["message_ts"] != message.get("ts"):
+            return recent_rows[0]
+        return None
+
+    def looks_like_context_message(self, text: str) -> bool:
+        normalized = normalize_for_matching(text)
+        if not normalized:
+            return False
+        starters = (
+            "ademas",
+            "tambien",
+            "contexto",
+            "dato",
+            "detalle",
+            "sumo",
+            "agrego",
+            "te paso",
+            "aca",
+            "ahi",
+            "me olvide",
+            "por las dudas",
+            "el link",
+            "la captura",
+        )
+        return normalized.startswith(starters) or "http://" in normalized or "https://" in normalized
 
     def get_task_row(self, channel_id: str, message_ts: str) -> Optional[sqlite3.Row]:
         with self.db_connect() as conn:
@@ -1165,6 +1793,7 @@ class AgentApp:
         action = task_row["requested_action"] or "Sin acción especificada"
         raw_text = task_row["raw_text"] or ""
         context_text = task_row["context_text"] or ""
+        context_additions = self.task_context_additions_text(task_row["id"])
         links_text = self.get_message_links_context(task_row["channel_id"], task_row["message_ts"])
         name = summary[:120]
         description = "\n".join(
@@ -1181,6 +1810,9 @@ class AgentApp:
                 "",
                 "Contexto reciente:",
                 context_text or "Sin contexto reciente.",
+                "",
+                "Contexto agregado:",
+                context_additions or "Sin contexto agregado.",
                 "",
                 "URLs detectadas:",
                 links_text,
@@ -1296,6 +1928,184 @@ class AgentApp:
         for row in rows:
             synced += int(self.sync_task_to_trello(row))
         return synced
+
+    def is_trello_card_done(self, card: TrelloCardState) -> bool:
+        if self.config.trello_done_list_id and card.list_id == self.config.trello_done_list_id:
+            return True
+        normalized_list_name = normalize_for_matching(card.list_name)
+        return bool(normalized_list_name and normalized_list_name in self.config.trello_done_list_names)
+
+    def mark_task_trello_check_failed(self, task_id: int, error_message: str) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET trello_last_error = ?,
+                    trello_synced_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (error_message[:1000], now_iso(), now_iso(), task_id),
+            )
+        self.record_task_event(task_id, "trello_done_check_failed", {"error": error_message[:1000]})
+
+    def build_final_reply_suggestion(self, task_row: sqlite3.Row) -> str:
+        address = self.requester_address(task_row)
+        summary = compact_text(task_row["summary"] or "el pedido", 180)
+        return f"{address}, ya quedó resuelto lo que me pediste sobre {summary}."
+
+    def mark_task_done_pending_reply(self, task_id: int, final_reply_suggestion: str) -> bool:
+        timestamp = now_iso()
+        with self.db_connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'done_pending_reply',
+                    reviewed_at = ?,
+                    done_pending_reply_at = COALESCE(NULLIF(done_pending_reply_at, ''), ?),
+                    final_reply_suggestion = ?,
+                    reply_error = NULL,
+                    updated_at = ?,
+                    snoozed_until = NULL
+                WHERE id = ?
+                  AND COALESCE(status, 'new') != 'done_pending_reply'
+                """,
+                (timestamp, timestamp, final_reply_suggestion, timestamp, task_id),
+            )
+        if cursor.rowcount > 0:
+            self.record_task_event(
+                task_id,
+                "done_pending_reply",
+                {"final_reply_suggestion": final_reply_suggestion},
+            )
+            return True
+        return False
+
+    def mark_task_telegram_notified(self, task_id: int) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET telegram_notified_at = ?,
+                    telegram_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now_iso(), now_iso(), task_id),
+            )
+        self.record_task_event(task_id, "telegram_notified", {})
+
+    def mark_task_telegram_failed(self, task_id: int, error_message: str) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET telegram_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (error_message[:1000], now_iso(), task_id),
+            )
+        self.record_task_event(task_id, "telegram_failed", {"error": error_message[:1000]})
+
+    def build_telegram_approval_message(self, task_row: sqlite3.Row) -> str:
+        context_additions = self.task_context_additions_text(task_row["id"])
+        context_parts = [
+            f"Original: {compact_text(task_row['raw_text'] or '(sin texto)', 700)}",
+        ]
+        if task_row["context_text"]:
+            context_parts.append(f"Contexto reciente: {compact_text(task_row['context_text'], 700)}")
+        if context_additions:
+            context_parts.append(f"Agregado: {compact_text(context_additions, 900)}")
+
+        suggestion = task_row["manual_reply"] or task_row["final_reply_suggestion"] or self.build_final_reply_suggestion(task_row)
+        return "\n".join(
+            [
+                f"Tarea #{task_row['id']} lista para respuesta final",
+                f"Solicitante: {task_row['requester_label'] or task_row['sender_label'] or 'unknown'}",
+                f"Resumen: {task_row['summary'] or 'Sin resumen'}",
+                "",
+                "Contexto relevante:",
+                "\n".join(context_parts),
+                "",
+                "Respuesta final sugerida:",
+                suggestion,
+                "",
+                "Comandos:",
+                f"/send {task_row['id']}",
+                f"/edit {task_row['id']} texto",
+                f"/nosend {task_row['id']}",
+            ]
+        )
+
+    def send_done_pending_telegram(self, task_id: int) -> bool:
+        task_row = self.get_task_by_id(task_id)
+        if not task_row:
+            return False
+
+        if not self.config.telegram_enabled:
+            self.mark_task_telegram_failed(task_id, "Telegram está deshabilitado.")
+            return False
+
+        try:
+            client = self.get_telegram_client()
+            client.send_message(self.build_telegram_approval_message(task_row))
+        except Exception as exc:
+            self.mark_task_telegram_failed(task_id, str(exc))
+            print(f"[yellow]No pude enviar aprobación Telegram para tarea #{task_id}: {exc}[/yellow]")
+            return False
+
+        self.mark_task_telegram_notified(task_id)
+        return True
+
+    def sync_trello_done_tasks(self, limit: int = 50) -> int:
+        if not self.config.trello_enabled:
+            return 0
+
+        with self.db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT tasks.*,
+                       processed_messages.raw_text,
+                       processed_messages.context_text
+                FROM tasks
+                LEFT JOIN processed_messages
+                  ON processed_messages.channel_id = tasks.channel_id
+                 AND processed_messages.message_ts = tasks.message_ts
+                WHERE tasks.trello_card_id IS NOT NULL
+                  AND tasks.trello_card_id != ''
+                  AND COALESCE(tasks.status, 'new') NOT IN (
+                    'done',
+                    'ignored',
+                    'dismissed',
+                    'archived',
+                    'responded',
+                    'done_pending_reply'
+                  )
+                ORDER BY tasks.id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        moved = 0
+        for row in rows:
+            try:
+                card = self.get_trello_client().get_card(row["trello_card_id"])
+            except Exception as exc:
+                self.mark_task_trello_check_failed(row["id"], str(exc))
+                print(f"[yellow]No pude chequear Trello para tarea #{row['id']}: {exc}[/yellow]")
+                continue
+
+            if not self.is_trello_card_done(card):
+                continue
+
+            final_reply = self.build_final_reply_suggestion(row)
+            if self.mark_task_done_pending_reply(row["id"], final_reply):
+                self.send_done_pending_telegram(row["id"])
+                moved += 1
+
+        return moved
 
     def list_conversations(self) -> list[dict[str, Any]]:
         conversations: list[dict[str, Any]] = []
@@ -1564,16 +2374,24 @@ Reglas:
         )
 
         if classification.is_actionable:
+            thread_ts = self.message_thread_ts(message)
+            case_key = self.build_case_key(conversation["id"], thread_ts)
             inserted = self.save_task(
                 channel_id=conversation["id"],
                 message_ts=message["ts"],
+                thread_ts=thread_ts,
+                case_key=case_key,
                 user_id=message.get("user"),
                 sender_label=state["sender_label"],
                 conversation_label=state["conversation_label"],
                 classification=classification,
             )
-            if inserted and self.config.trello_enabled and self.config.trello_auto_create:
-                self.sync_task_to_trello_by_message(conversation["id"], message["ts"])
+            if inserted:
+                task_row = self.get_task_row(conversation["id"], message["ts"])
+                if task_row:
+                    self.send_task_acknowledgement(task_row["id"])
+                if self.config.trello_enabled and self.config.trello_auto_create:
+                    self.sync_task_to_trello_by_message(conversation["id"], message["ts"])
 
             print("\n[bold cyan]Nueva tarea detectada[/bold cyan]")
             print(f"[bold]Conversación:[/bold] {state['conversation_label']}")
@@ -1622,6 +2440,17 @@ Reglas:
         }
 
         try:
+            if message.get("user") != my_user_id or self.config.include_self_for_test:
+                existing_case = self.find_existing_case_for_message(message, conversation, sender_label)
+                if existing_case:
+                    self.add_context_to_task(
+                        existing_case,
+                        message=message,
+                        conversation=conversation,
+                        sender_label=sender_label,
+                        conversation_label=conversation_label,
+                    )
+                    return
             self.build_graph().invoke(state)
         except Exception as exc:
             self.mark_processed_failed(
@@ -1677,14 +2506,23 @@ Reglas:
                     classification=classification,
                 )
                 if classification.is_actionable:
-                    self.save_task(
+                    thread_ts = row["message_ts"]
+                    inserted = self.save_task(
                         channel_id=row["channel_id"],
                         message_ts=row["message_ts"],
+                        thread_ts=thread_ts,
+                        case_key=self.build_case_key(row["channel_id"], thread_ts),
                         user_id=row["user_id"],
                         sender_label=row["sender_label"] or "unknown",
                         conversation_label=row["conversation_label"] or row["channel_id"],
                         classification=classification,
                     )
+                    if inserted:
+                        task_row = self.get_task_row(row["channel_id"], row["message_ts"])
+                        if task_row:
+                            self.send_task_acknowledgement(task_row["id"])
+                        if self.config.trello_enabled and self.config.trello_auto_create:
+                            self.sync_task_to_trello_by_message(row["channel_id"], row["message_ts"])
                 recovered += 1
             except Exception as exc:
                 self.mark_processed_failed(
@@ -1721,6 +2559,9 @@ Reglas:
         self.retry_failed_messages(limit=25)
         if self.config.trello_enabled and self.config.trello_auto_create:
             self.sync_pending_trello_tasks(limit=25)
+        if self.config.trello_enabled:
+            self.sync_trello_done_tasks(limit=25)
+        self.poll_telegram_updates(limit=25)
         total_new = 0
 
         for conversation in conversations:
@@ -1755,7 +2596,7 @@ Reglas:
                     continue
 
                 status = self.get_processed_status(channel_id, ts_value)
-                if status in {"done", "ignored"}:
+                if status in {"done", "ignored", "context_added", "context_duplicate"}:
                     continue
 
                 self.process_message(message, conversation, my_user_id=my_user_id)
@@ -1767,6 +2608,9 @@ Reglas:
         self.retry_failed_messages(limit=25)
         if self.config.trello_enabled and self.config.trello_auto_create:
             self.sync_pending_trello_tasks(limit=25)
+        if self.config.trello_enabled:
+            self.sync_trello_done_tasks(limit=25)
+        self.poll_telegram_updates(limit=25)
         print(f"[green]Poll terminado.[/green] Mensajes humanos nuevos procesados: {total_new}")
 
     def fetch_open_tasks_for_brief(self, limit: int = 200) -> list[sqlite3.Row]:
@@ -1840,6 +2684,9 @@ Reglas:
             "reply_ts": row["reply_ts"] or "",
             "reply_error": row["reply_error"] or "",
             "manual_reply": row["manual_reply"] or "",
+            "done_pending_reply_at": row["done_pending_reply_at"] or "",
+            "final_reply_suggestion": row["final_reply_suggestion"] or "",
+            "telegram_error": row["telegram_error"] or "",
             "needs_reply": bool(classification.get("needs_reply")),
             "needs_external_system": bool(classification.get("needs_external_system")),
             "external_systems": external_systems,
@@ -1865,8 +2712,12 @@ Reglas:
             details.append(f"Trello: {task['trello_status']}")
         if task["status"] == "reply_approved" and not task["reply_sent_at"]:
             details.append("Respuesta aprobada sin enviar")
+        if task["status"] == "done_pending_reply":
+            details.append("Respuesta final pendiente de Telegram")
         if task["reply_error"]:
             details.append(f"Error Slack: {compact_text(task['reply_error'], 90)}")
+        if task["telegram_error"]:
+            details.append(f"Error Telegram: {compact_text(task['telegram_error'], 90)}")
         return line + "\n  " + " | ".join(details)
 
     def add_brief_section(
@@ -2132,10 +2983,11 @@ Reglas:
                 UPDATE tasks
                 SET status = ?,
                     reviewed_at = ?,
+                    updated_at = ?,
                     snoozed_until = CASE WHEN ? != 'snoozed' THEN NULL ELSE snoozed_until END
                 WHERE id = ?
                 """,
-                (status, now_iso(), status, task_id),
+                (status, now_iso(), now_iso(), status, task_id),
             )
         self.record_task_event(task_id, "status_changed", {"status": status})
 
@@ -2149,10 +3001,11 @@ Reglas:
                     reply_approved_at = ?,
                     manual_reply = ?,
                     reply_error = NULL,
+                    updated_at = ?,
                     snoozed_until = NULL
                 WHERE id = ?
                 """,
-                (now_iso(), now_iso(), reply_text, task_id),
+                (now_iso(), now_iso(), reply_text, now_iso(), task_id),
             )
         self.record_task_event(task_id, "reply_approved", {"reply_text": reply_text})
 
@@ -2166,10 +3019,11 @@ Reglas:
                     reply_sent_at = ?,
                     reply_ts = ?,
                     reply_error = NULL,
+                    updated_at = ?,
                     snoozed_until = NULL
                 WHERE id = ?
                 """,
-                (now_iso(), now_iso(), reply_ts, task_id),
+                (now_iso(), now_iso(), reply_ts, now_iso(), task_id),
             )
         self.record_task_event(task_id, "reply_sent", {"reply_ts": reply_ts})
 
@@ -2179,16 +3033,20 @@ Reglas:
                 """
                 UPDATE tasks
                 SET reviewed_at = ?,
-                    reply_error = ?
+                    reply_error = ?,
+                    updated_at = ?
                 WHERE id = ?
                 """,
-                (now_iso(), error_message[:1000], task_id),
+                (now_iso(), error_message[:1000], now_iso(), task_id),
             )
         self.record_task_event(task_id, "reply_failed", {"error": error_message[:1000]})
 
     def reply_text_for_task(self, task_row: sqlite3.Row) -> str:
         if task_row["manual_reply"]:
             return task_row["manual_reply"].strip()
+
+        if task_row["final_reply_suggestion"]:
+            return task_row["final_reply_suggestion"].strip()
 
         try:
             classification = json.loads(task_row["classification_json"] or "{}")
@@ -2240,6 +3098,92 @@ Reglas:
             return self.send_approved_reply(task_id)
         return True
 
+    def edit_task_manual_reply(self, task_id: int, reply_text: str) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET manual_reply = ?,
+                    reply_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (reply_text, now_iso(), task_id),
+            )
+        self.record_task_event(task_id, "manual_reply_edited", {"reply_text": reply_text})
+
+    def handle_telegram_command(self, command_text: str) -> bool:
+        self.init_db()
+        raw = command_text.strip()
+        if not raw:
+            return False
+
+        parts = raw.split(maxsplit=2)
+        command = parts[0].split("@", 1)[0].lower()
+        if command not in {"/send", "/edit", "/nosend"}:
+            return False
+        if len(parts) < 2 or not parts[1].isdigit():
+            return False
+
+        task_id = int(parts[1])
+        task_row = self.get_task_by_id(task_id)
+        if not task_row:
+            raise RuntimeError(f"No encontré la tarea #{task_id}.")
+
+        if command == "/edit":
+            if len(parts) < 3 or not parts[2].strip():
+                raise RuntimeError("/edit requiere texto.")
+            self.edit_task_manual_reply(task_id, parts[2].strip())
+            return True
+
+        if command == "/send":
+            return self.send_approved_reply(task_id)
+
+        if command == "/nosend":
+            self.mark_task_status(task_id, "done")
+            self.record_task_event(task_id, "final_reply_suppressed", {})
+            return True
+
+        return False
+
+    def poll_telegram_updates(self, limit: int = 20) -> int:
+        if not self.config.telegram_enabled or not self.has_telegram_config():
+            return 0
+
+        self.init_db()
+        raw_offset = self.get_agent_state("telegram_update_offset")
+        offset = int(raw_offset) if raw_offset and raw_offset.isdigit() else None
+        try:
+            updates = self.get_telegram_client().get_updates(offset=offset, limit=limit)
+        except Exception as exc:
+            print(f"[yellow]No pude leer updates de Telegram: {exc}[/yellow]")
+            return 0
+
+        handled = 0
+        next_offset = offset
+        for update in updates:
+            update_id = update.get("update_id")
+            if isinstance(update_id, int):
+                next_offset = max(next_offset or 0, update_id + 1)
+
+            message = update.get("message") or update.get("edited_message") or {}
+            chat = message.get("chat") or {}
+            if str(chat.get("id") or "") != str(self.config.telegram_chat_id):
+                continue
+
+            text = message.get("text") or ""
+            if not text:
+                continue
+
+            try:
+                handled += int(self.handle_telegram_command(text))
+            except Exception as exc:
+                print(f"[yellow]No pude procesar comando Telegram `{text}`: {exc}[/yellow]")
+
+        if next_offset is not None:
+            self.set_agent_state("telegram_update_offset", str(next_offset))
+        return handled
+
     def snooze_task(self, task_id: int, snoozed_until: datetime) -> None:
         if snoozed_until.tzinfo is None:
             snoozed_until = snoozed_until.replace(tzinfo=timezone.utc)
@@ -2249,10 +3193,11 @@ Reglas:
                 UPDATE tasks
                 SET status = 'snoozed',
                     reviewed_at = ?,
-                    snoozed_until = ?
+                    snoozed_until = ?,
+                    updated_at = ?
                 WHERE id = ?
                 """,
-                (now_iso(), snoozed_until.astimezone(timezone.utc).isoformat(), task_id),
+                (now_iso(), snoozed_until.astimezone(timezone.utc).isoformat(), now_iso(), task_id),
             )
         self.record_task_event(
             task_id,

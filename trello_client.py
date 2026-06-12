@@ -21,6 +21,16 @@ class TrelloCard:
 
 
 @dataclass(frozen=True)
+class TrelloCardState:
+    id: str
+    name: str
+    url: str
+    list_id: str
+    list_name: str
+    closed: bool
+
+
+@dataclass(frozen=True)
 class TrelloList:
     id: str
     name: str
@@ -108,6 +118,33 @@ class TrelloClient:
             id=payload["id"],
             name=payload["name"],
             url=payload["url"],
+        )
+
+    def get_card(self, card_id: str) -> TrelloCardState:
+        payload = self._request(
+            "GET",
+            f"/cards/{card_id}",
+            params={
+                "fields": "name,url,idList,closed",
+                "list": "true",
+                "list_fields": "name",
+            },
+        )
+        card_list = payload.get("list") or {}
+        return TrelloCardState(
+            id=payload["id"],
+            name=payload.get("name") or "",
+            url=payload.get("url") or "",
+            list_id=payload.get("idList") or "",
+            list_name=card_list.get("name") or "",
+            closed=bool(payload.get("closed")),
+        )
+
+    def add_card_comment(self, card_id: str, text: str) -> None:
+        self._request(
+            "POST",
+            f"/cards/{card_id}/actions/comments",
+            json_body={"text": text},
         )
 
 

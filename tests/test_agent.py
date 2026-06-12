@@ -2,7 +2,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from main import build_parser
-from trello_client import TrelloCard
+from trello_client import TrelloCard, TrelloCardState
 from slack_personal_agent import (
     AgentApp,
     AgentConfig,
@@ -116,9 +116,18 @@ class FakeSlackClient:
 
 
 class FakeTrelloClient:
-    def __init__(self, should_fail=False):
+    def __init__(self, should_fail=False, card_state=None):
         self.should_fail = should_fail
+        self.card_state = card_state or TrelloCardState(
+            id="card123",
+            name="Test card",
+            url="https://trello.com/c/card123",
+            list_id="list123",
+            list_name="Inbox",
+            closed=False,
+        )
         self.created_cards = []
+        self.comments = []
 
     def get_me(self):
         return {"fullName": "Ivan Rodriguez", "username": "ivan"}
@@ -132,6 +141,32 @@ class FakeTrelloClient:
         self.created_cards.append(kwargs)
         return TrelloCard(id="card123", name=kwargs["name"], url="https://trello.com/c/card123")
 
+    def get_card(self, card_id):
+        if self.should_fail:
+            raise RuntimeError("trello down")
+        return self.card_state
+
+    def add_card_comment(self, card_id, text):
+        if self.should_fail:
+            raise RuntimeError("trello down")
+        self.comments.append({"card_id": card_id, "text": text})
+
+
+class FakeTelegramClient:
+    def __init__(self, send_error=None, updates=None):
+        self.send_error = send_error
+        self.sent_messages = []
+        self.updates = list(updates or [])
+
+    def send_message(self, text):
+        self.sent_messages.append(text)
+        if self.send_error is not None:
+            raise self.send_error
+        return {"ok": True}
+
+    def get_updates(self, offset=None, limit=20):
+        return list(self.updates[:limit])
+
 
 def get_processed_row(db_path):
     with sqlite3.connect(db_path) as conn:
@@ -144,6 +179,12 @@ def get_processed_row(db_path):
 def count_tasks(db_path):
     with sqlite3.connect(db_path) as conn:
         return conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+
+def get_task(db_path, where="1 = 1", params=()):
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(f"SELECT * FROM tasks WHERE {where} ORDER BY id ASC LIMIT 1", params).fetchone()
 
 
 def insert_task(
@@ -160,6 +201,7 @@ def insert_task(
     conversation_label="DM con Ana Gomez",
     status="new",
     trello_status="created",
+    trello_card_id="",
     trello_card_url="",
     trello_last_error="",
 ):
@@ -179,11 +221,12 @@ def insert_task(
                 category,
                 status,
                 trello_status,
+                trello_card_id,
                 trello_card_url,
                 trello_last_error,
                 classification_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 created_at,
@@ -198,6 +241,7 @@ def insert_task(
                 category,
                 status,
                 trello_status,
+                trello_card_id,
                 trello_card_url,
                 trello_last_error,
                 classification.model_dump_json(),
@@ -257,6 +301,168 @@ def test_actionable_task_can_auto_sync_to_trello(tmp_path):
     assert task["trello_status"] == "created"
     assert task["trello_card_url"] == "https://trello.com/c/card123"
     assert len(fake_trello.created_cards) == 1
+
+
+def test_new_dm_task_sends_automatic_ack_without_mention(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {"ts": "1.2", "text": "Revisás este reporte?", "user": "UOTHER"},
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    task = get_task(app.config.db_path)
+    assert task["acknowledged_at"]
+    assert fake_slack.post_calls[0]["channel"] == "D123"
+    assert fake_slack.post_calls[0]["thread_ts"] == "1.2"
+    assert fake_slack.post_calls[0]["text"].startswith("Dale, lo tomo.")
+    assert "<@UOTHER>" not in fake_slack.post_calls[0]["text"]
+
+
+def test_new_private_channel_task_ack_mentions_requester(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {"ts": "1.3", "text": "ivan, revisás este reporte?", "user": "UOTHER"},
+        {"id": "G123", "name": "finanzas", "is_private": True},
+        my_user_id="UME",
+    )
+
+    assert fake_slack.post_calls[0]["text"].startswith("<@UOTHER> Dale, lo tomo.")
+
+
+def test_new_group_dm_task_ack_mentions_requester(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {"ts": "1.4", "text": "Revisás este reporte?", "user": "UOTHER"},
+        {"id": "GMPIM", "name": "mpdm-test", "is_mpim": True},
+        my_user_id="UME",
+    )
+
+    assert fake_slack.post_calls[0]["text"].startswith("<@UOTHER> Dale, lo tomo.")
+
+
+def test_thread_context_updates_existing_task_without_duplicate_and_confirms(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_slack = FakeSlackClient()
+    fake_trello = FakeTrelloClient()
+    app = AgentApp(
+        make_config(
+            tmp_path,
+            TRELLO_ENABLED="true",
+            TRELLO_API_KEY="key",
+            TRELLO_TOKEN="token",
+            TRELLO_LIST_ID="list123",
+        ),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: fake_model,
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    conversation = {"id": "D123", "is_im": True, "user": "UOTHER"}
+
+    app.process_message(
+        {"ts": "1.5", "text": "Revisás este reporte?", "user": "UOTHER"},
+        conversation,
+        my_user_id="UME",
+    )
+    app.process_message(
+        {
+            "ts": "1.6",
+            "thread_ts": "1.5",
+            "text": "Además, usá el reporte de mayo como referencia.",
+            "user": "UOTHER",
+        },
+        conversation,
+        my_user_id="UME",
+    )
+
+    with sqlite3.connect(app.config.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        processed_context = conn.execute(
+            "SELECT classification_status FROM processed_messages WHERE message_ts = '1.6'"
+        ).fetchone()
+        context_events = conn.execute(
+            "SELECT details_json FROM task_events WHERE event_type = 'context_added'"
+        ).fetchall()
+        task = conn.execute("SELECT last_context_ack_at FROM tasks LIMIT 1").fetchone()
+
+    assert count_tasks(app.config.db_path) == 1
+    assert len(fake_model.calls) == 1
+    assert processed_context["classification_status"] == "context_added"
+    assert task["last_context_ack_at"]
+    assert "Buenísimo, gracias" in fake_slack.post_calls[1]["text"]
+    assert "Hay que revisar un reporte" in fake_slack.post_calls[1]["text"]
+    assert len(context_events) == 1
+    assert fake_trello.comments[0]["card_id"] == "card123"
+    assert "reporte de mayo" in fake_trello.comments[0]["text"]
+
+
+def test_duplicate_thread_context_does_not_send_confirmation(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    conversation = {"id": "D123", "is_im": True, "user": "UOTHER"}
+
+    app.process_message(
+        {"ts": "1.7", "text": "Revisás este reporte?", "user": "UOTHER"},
+        conversation,
+        my_user_id="UME",
+    )
+    app.process_message(
+        {
+            "ts": "1.8",
+            "thread_ts": "1.7",
+            "text": "Revisás este reporte?",
+            "user": "UOTHER",
+        },
+        conversation,
+        my_user_id="UME",
+    )
+
+    processed_context = get_processed_row(app.config.db_path)
+    with sqlite3.connect(app.config.db_path) as conn:
+        status = conn.execute(
+            "SELECT classification_status FROM processed_messages WHERE message_ts = '1.8'"
+        ).fetchone()[0]
+
+    assert processed_context["message_ts"] == "1.7"
+    assert status == "context_duplicate"
+    assert count_tasks(app.config.db_path) == 1
+    assert len(fake_slack.post_calls) == 1
 
 
 def test_channel_without_mention_is_ignored(tmp_path):
@@ -426,6 +632,291 @@ def test_trello_failure_marks_task_as_failed(tmp_path):
         task = conn.execute("SELECT trello_status, trello_last_error FROM tasks LIMIT 1").fetchone()
     assert task["trello_status"] == "failed"
     assert "trello down" in task["trello_last_error"]
+
+
+def test_trello_done_marks_done_pending_reply_and_sends_telegram(tmp_path):
+    fake_trello = FakeTrelloClient(
+        card_state=TrelloCardState(
+            id="card123",
+            name="Reporte",
+            url="https://trello.com/c/card123",
+            list_id="done123",
+            list_name="Hecho",
+            closed=False,
+        )
+    )
+    fake_telegram = FakeTelegramClient()
+    app = AgentApp(
+        make_config(
+            tmp_path,
+            TRELLO_ENABLED="true",
+            TRELLO_API_KEY="key",
+            TRELLO_TOKEN="token",
+            TELEGRAM_ENABLED="true",
+            TELEGRAM_BOT_TOKEN="bot-token",
+            TELEGRAM_CHAT_ID="123",
+        ),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        telegram_client=fake_telegram,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="50.0",
+        summary="Validar reporte mensual",
+        requested_action="Comparar el reporte",
+        priority="medium",
+        category="data",
+        classification=make_classification(summary="Validar reporte mensual"),
+        trello_card_id="card123",
+        trello_card_url="https://trello.com/c/card123",
+    )
+
+    synced = app.sync_trello_done_tasks()
+
+    task = get_task(app.config.db_path)
+    assert synced == 1
+    assert task["status"] == "done_pending_reply"
+    assert task["done_pending_reply_at"]
+    assert task["final_reply_suggestion"] == (
+        "Ana, ya quedó resuelto lo que me pediste sobre Validar reporte mensual."
+    )
+    assert task["telegram_notified_at"]
+    assert "Tarea #1 lista para respuesta final" in fake_telegram.sent_messages[0]
+    assert "Solicitante: Ana Gomez" in fake_telegram.sent_messages[0]
+    assert "/send 1" in fake_telegram.sent_messages[0]
+    assert "/edit 1 texto" in fake_telegram.sent_messages[0]
+    assert "/nosend 1" in fake_telegram.sent_messages[0]
+
+
+def test_trello_done_channel_final_reply_uses_mention(tmp_path):
+    fake_trello = FakeTrelloClient(
+        card_state=TrelloCardState(
+            id="card123",
+            name="Reporte",
+            url="https://trello.com/c/card123",
+            list_id="done123",
+            list_name="Hecho",
+            closed=False,
+        )
+    )
+    app = AgentApp(
+        make_config(
+            tmp_path,
+            TRELLO_ENABLED="true",
+            TRELLO_API_KEY="key",
+            TRELLO_TOKEN="token",
+            TELEGRAM_ENABLED="true",
+            TELEGRAM_BOT_TOKEN="bot-token",
+            TELEGRAM_CHAT_ID="123",
+        ),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        telegram_client=FakeTelegramClient(),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="50.1",
+        summary="Validar forecast",
+        requested_action="Comparar forecast",
+        priority="medium",
+        category="data",
+        classification=make_classification(summary="Validar forecast"),
+        sender_label="Ana Gomez",
+        conversation_label="#finanzas",
+        trello_card_id="card123",
+        trello_card_url="https://trello.com/c/card123",
+    )
+    with sqlite3.connect(app.config.db_path) as conn:
+        conn.execute(
+            """
+            UPDATE tasks
+            SET channel_id = 'G123',
+                requester_user_id = 'UOTHER',
+                requester_label = 'Ana Gomez'
+            WHERE id = 1
+            """
+        )
+
+    app.sync_trello_done_tasks()
+
+    task = get_task(app.config.db_path)
+    assert task["final_reply_suggestion"] == (
+        "<@UOTHER>, ya quedó resuelto lo que me pediste sobre Validar forecast."
+    )
+
+
+def test_telegram_edit_updates_manual_reply(tmp_path):
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="51.0",
+        summary="Responder cierre",
+        requested_action="Cerrar pedido",
+        priority="medium",
+        category="communications",
+        classification=make_classification(summary="Responder cierre"),
+    )
+    app.mark_task_done_pending_reply(1, "Ana, ya quedó resuelto.")
+
+    assert app.handle_telegram_command("/edit 1 Quedó resuelto, gracias por avisar.")
+
+    task = get_task(app.config.db_path)
+    assert task["manual_reply"] == "Quedó resuelto, gracias por avisar."
+
+
+def test_telegram_send_sends_approved_final_reply_to_slack(tmp_path):
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="52.0",
+        summary="Responder cierre",
+        requested_action="Cerrar pedido",
+        priority="medium",
+        category="communications",
+        classification=make_classification(summary="Responder cierre"),
+    )
+    app.mark_task_done_pending_reply(1, "Ana, ya quedó resuelto.")
+    app.edit_task_manual_reply(1, "Listo, quedó resuelto.")
+
+    assert app.handle_telegram_command("/send 1")
+
+    task = get_task(app.config.db_path)
+    assert task["status"] == "responded"
+    assert task["reply_sent_at"]
+    assert fake_slack.post_calls == [
+        {
+            "channel": "D52.0",
+            "thread_ts": "52.0",
+            "text": "Listo, quedó resuelto.",
+            "unfurl_links": False,
+            "unfurl_media": False,
+        }
+    ]
+
+
+def test_telegram_nosend_marks_done_without_slack_reply(tmp_path):
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="53.0",
+        summary="Responder cierre",
+        requested_action="Cerrar pedido",
+        priority="medium",
+        category="communications",
+        classification=make_classification(summary="Responder cierre"),
+    )
+    app.mark_task_done_pending_reply(1, "Ana, ya quedó resuelto.")
+
+    assert app.handle_telegram_command("/nosend 1")
+
+    task = get_task(app.config.db_path)
+    assert task["status"] == "done"
+    assert fake_slack.post_calls == []
+
+
+def test_telegram_failure_is_saved_without_breaking_done_sync(tmp_path):
+    fake_trello = FakeTrelloClient(
+        card_state=TrelloCardState(
+            id="card123",
+            name="Reporte",
+            url="https://trello.com/c/card123",
+            list_id="done123",
+            list_name="Hecho",
+            closed=False,
+        )
+    )
+    app = AgentApp(
+        make_config(
+            tmp_path,
+            TRELLO_ENABLED="true",
+            TRELLO_API_KEY="key",
+            TRELLO_TOKEN="token",
+            TELEGRAM_ENABLED="true",
+            TELEGRAM_BOT_TOKEN="bot-token",
+            TELEGRAM_CHAT_ID="123",
+        ),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        telegram_client=FakeTelegramClient(send_error=RuntimeError("telegram down")),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="54.0",
+        summary="Validar reporte mensual",
+        requested_action="Comparar el reporte",
+        priority="medium",
+        category="data",
+        classification=make_classification(summary="Validar reporte mensual"),
+        trello_card_id="card123",
+        trello_card_url="https://trello.com/c/card123",
+    )
+
+    assert app.sync_trello_done_tasks() == 1
+
+    task = get_task(app.config.db_path)
+    assert task["status"] == "done_pending_reply"
+    assert task["telegram_notified_at"] is None
+    assert task["telegram_error"] == "telegram down"
+
+
+def test_slack_ack_failure_is_saved_without_breaking_processing(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_slack = FakeSlackClient(post_error=RuntimeError("slack down"))
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {"ts": "55.0", "text": "Revisás este reporte?", "user": "UOTHER"},
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    task = get_task(app.config.db_path)
+    row = get_processed_row(app.config.db_path)
+    assert row["classification_status"] == "done"
+    assert task["acknowledged_at"] is None
+    assert task["ack_error"] == "slack down"
 
 
 def test_trello_client_can_be_built_without_list_id_for_listing(tmp_path):

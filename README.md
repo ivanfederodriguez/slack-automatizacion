@@ -7,11 +7,13 @@ Agente personal para Slack que:
 - genera una clasificacion estructurada y un borrador de respuesta;
 - guarda tareas en SQLite;
 - opcionalmente crea cards en Trello;
-- permite revisar, aprobar y enviar respuestas solo con confirmacion explicita.
+- acusa recibo y suma contexto automaticamente en el thread del pedido;
+- permite revisar, aprobar y enviar respuestas finales solo con confirmacion explicita;
+- usa Telegram como canal privado de aprobacion cuando Trello marca una tarea como hecha.
 
 La regla operativa importante es esta:
 
-> nada se envia a Slack sin una accion explicita de Ivan.
+> solo se envian automaticamente acuses de recibo y confirmaciones de contexto. Las respuestas finales o explicaciones de solucion requieren una accion explicita de Ivan.
 
 ## Estado actual
 
@@ -24,7 +26,8 @@ El CLI ya cubre una v0 util para uso personal:
 - `brief` resume tareas abiertas y respuestas aprobadas sin enviar;
 - `review` permite aprobar, editar, ignorar, snoozear o marcar done;
 - `approve-reply` aprueba una respuesta puntual y opcionalmente la envia;
-- `trello-*` cubre auth, listado de listas y resincronizacion;
+- `trello-*` cubre auth, listado de listas, resincronizacion y deteccion de cards hechas;
+- `telegram-poll` procesa comandos de aprobacion enviados por Ivan;
 - `install-autostart` y `uninstall-autostart` manejan launch agents locales.
 
 ## Requisitos
@@ -33,6 +36,7 @@ El CLI ya cubre una v0 util para uso personal:
 - un token de Slack valido en `SLACK_USER_TOKEN`
 - Ollama local o Groq, segun `MODEL_PROVIDER`
 - Trello opcional
+- Telegram opcional para aprobacion privada
 
 El token de Slack que uses debe poder llamar, como minimo, a estos metodos que el codigo usa hoy:
 
@@ -43,7 +47,7 @@ El token de Slack que uses debe poder llamar, como minimo, a estos metodos que e
 - `conversations.replies`
 - `chat.postMessage`
 
-Si `chat.postMessage` falla con algo como `missing_scope` o `not_allowed_token_type`, el agente deja auditado el error en `reply_error` y no marca la tarea como respondida.
+Si `chat.postMessage` falla con algo como `missing_scope` o `not_allowed_token_type`, el agente deja auditado el error en `ack_error`, `context_ack_error` o `reply_error` segun el paso afectado, y no marca la tarea como respondida cuando se trata de una respuesta final.
 
 ## Instalacion
 
@@ -91,6 +95,13 @@ TRELLO_LIST_ID=
 TRELLO_MEMBER_IDS=
 TRELLO_LABEL_IDS=
 TRELLO_CARD_POSITION=top
+TRELLO_DONE_LIST_ID=
+TRELLO_DONE_LIST_NAMES=Hecho,Done
+
+# Telegram opcional
+TELEGRAM_ENABLED=false
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 
 DB_PATH=slack_agent.db
 ```
@@ -100,7 +111,32 @@ Notas utiles:
 - el agente monitorea `private_channel`, `im` y `mpim`;
 - los canales publicos quedan fuera de alcance por ahora;
 - la base local por defecto es `slack_agent.db`;
-- si `TRELLO_ENABLED=false`, todo el flujo principal sigue funcionando sin Trello.
+- si `TRELLO_ENABLED=false`, todo el flujo principal sigue funcionando sin Trello;
+- si `TELEGRAM_ENABLED=false`, las tareas hechas quedan en `done_pending_reply` con error auditado hasta configurar Telegram o cerrarlas manualmente.
+
+## Flujo conversacional
+
+Cuando detecta una tarea accionable nueva, el agente responde en el thread original:
+
+```text
+Dale, lo tomo. Lo registre como: '{summary}'. Si queres, podes agregar contexto en este mismo hilo.
+```
+
+En DM no menciona al solicitante. En canales privados y group DMs antepone `<@user_id>`.
+
+Si llega contexto nuevo en el mismo thread, actualiza la tarea existente, agrega comentario en Trello si la card existe y confirma:
+
+```text
+Buenisimo, gracias. Lo sumo al pedido. El registro queda como: '{summary_actualizado}'.
+```
+
+Cuando una card pasa a una lista configurada como hecha (`TRELLO_DONE_LIST_ID` o nombre en `TRELLO_DONE_LIST_NAMES`), la tarea cambia a `done_pending_reply`. El agente no contesta Slack: prepara un cierre seguro y manda Telegram a Ivan con:
+
+```text
+/send TASK_ID
+/edit TASK_ID texto
+/nosend TASK_ID
+```
 
 ## Primer arranque
 
@@ -194,6 +230,8 @@ python main.py tasks --limit 20
 python main.py trello-auth-url
 python main.py trello-lists
 python main.py trello-sync --limit 20
+python main.py trello-done-sync --limit 50
+python main.py telegram-poll --limit 20
 python main.py install-autostart
 python main.py uninstall-autostart
 ```
@@ -207,11 +245,21 @@ La base ya guarda informacion para auditar el flujo de respuesta:
 - `reply_ts`
 - `reply_error`
 - `manual_reply`
+- `case_key`
+- `requester_user_id`
+- `requester_label`
+- `thread_ts`
+- `acknowledged_at`
+- `last_context_ack_at`
+- `done_pending_reply_at`
+- `final_reply_suggestion`
+- `telegram_error`
 
 Estados utiles:
 
 - `new`
 - `reply_approved`
+- `done_pending_reply`
 - `responded`
 - `ignored`
 - `done`
@@ -230,13 +278,15 @@ La suite actual cubre, entre otras cosas:
 - clasificacion y relevancia;
 - enrichment de URLs;
 - sync a Trello;
+- acuse automatico y actualizacion de contexto;
+- deteccion de cards hechas y aprobacion Telegram;
 - review interactivo;
 - aprobacion de respuestas;
 - envio exitoso y fallo de envio a Slack.
 
 ## Lo que no hace todavia
 
-- no responde automaticamente por defecto;
+- no envia respuestas finales automaticamente;
 - no procesa canales publicos;
 - no resuelve permisos de Slack por si solo;
 - no intenta enviar si no hay texto aprobado o borrador disponible.
