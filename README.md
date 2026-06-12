@@ -9,7 +9,7 @@ Agente personal para Slack que:
 - opcionalmente crea cards en Trello;
 - acusa recibo y suma contexto automaticamente en el thread del pedido;
 - permite revisar, aprobar y enviar respuestas finales solo con confirmacion explicita;
-- usa Telegram como canal privado de aprobacion cuando Trello marca una tarea como hecha.
+- usa Telegram como canal privado de aprobacion cuando `FINAL_REPLY_MODE=telegram_approval`, o responde directo en Slack cuando `FINAL_REPLY_MODE=slack_auto`.
 
 La regla operativa importante es esta:
 
@@ -107,6 +107,9 @@ TRELLO_DONE_LIST_NAMES=Hecho,Done
 TRELLO_WAITING_ENABLED=true
 TRELLO_WAITING_COMMENT_PREFIX=Pedir:
 TRELLO_WAITING_AUTO_CLEAR=true
+TRELLO_REPLY_ENABLED=true
+TRELLO_REPLY_COMMENT_PREFIX=Responder:
+TRELLO_REPLY_MARK_RESPONDED=false
 
 # Telegram opcional
 TELEGRAM_ENABLED=false
@@ -133,6 +136,14 @@ LOCAL_WHISPER_CACHE_DIR=~/Library/Application Support/slack-personal-agent/audio
 AUDIO_TRANSCRIPT_FUSION_ENABLED=true
 AUDIO_TRANSCRIPT_FUSION_MODEL=main
 
+# Adjuntos visuales de Slack
+SLACK_IMAGE_ATTACHMENTS_ENABLED=true
+TRELLO_ATTACH_SLACK_IMAGES=true
+TRELLO_IMAGE_ATTACHMENT_MODE=upload
+SLACK_IMAGE_KEEP_FILES=false
+SLACK_IMAGE_CACHE_DIR=~/Library/Application Support/slack-personal-agent/images
+SLACK_IMAGE_MAX_BYTES=15000000
+
 DB_PATH=slack_agent.db
 ```
 
@@ -144,6 +155,7 @@ Notas utiles:
 - en DMs, mensajes del mismo requester dentro de `CASE_GROUPING_WINDOW_MINUTES` se agrupan en el mismo caso aunque Slack no mande thread;
 - si `TRELLO_ENABLED=false`, todo el flujo principal sigue funcionando sin Trello;
 - `FINAL_REPLY_MODE=telegram_approval` mantiene aprobacion por Telegram; `FINAL_REPLY_MODE=slack_auto` responde directo en Slack cuando Ivan marca la card como hecha.
+- si `TRELLO_ATTACH_SLACK_IMAGES=true`, el token de Slack necesita `files:read` para descargar imagenes privadas y adjuntarlas a Trello.
 
 ## Flujo conversacional
 
@@ -179,12 +191,13 @@ Con `FINAL_REPLY_MODE=telegram_approval`, el agente no contesta Slack al detecta
 
 ## Trello operativo
 
-Trello queda como tablero operativo de Ivan con dos señales simples:
+Trello queda como tablero operativo de Ivan con tres señales simples:
 
 - comentario `Pedir:` significa pedir informacion al requester y dejar la tarea en `waiting_for_requester`;
+- comentario `Responder:` significa mandar una respuesta directa al thread original de Slack sin cerrar la tarea por default;
 - check nativo de Trello significa request completa y lista para cierre.
 
-No se usan checklists para waiting. Un check nunca significa waiting, y un comentario `Pedir:` nunca significa done.
+No se usan checklists para waiting. Un check nunca significa waiting, un comentario `Pedir:` nunca significa done y `Responder:` no marca done salvo que despues marques el check nativo.
 
 Para pedir informacion:
 
@@ -193,6 +206,13 @@ Para pedir informacion:
 3. El agente manda esa pregunta al hilo original de Slack.
 4. La task queda en `waiting_for_requester`.
 5. Cuando la persona responde por Slack, el agente suma el contexto, comenta en Trello `Respuesta recibida desde Slack: ...` y vuelve la tarea a `new`.
+
+Para responder algo puntual sin cerrar:
+
+1. Abrir la card en Trello.
+2. Agregar un comentario como `Responder: Te paso el link correcto: https://example.com`.
+3. El agente manda ese texto tal cual al thread original de Slack.
+4. La task sigue abierta, salvo que tambien marques el check nativo o actives `TRELLO_REPLY_MARK_RESPONDED=true`.
 
 Para cerrar:
 
@@ -233,6 +253,10 @@ Si usas un chat 1:1 con el bot, el `chat_id` suele ser un entero positivo. Si us
 
 Chequea cards ya creadas en Trello y, si alguna queda hecha segun `TRELLO_DONE_MODE`, cierra segun `FINAL_REPLY_MODE`: Slack directo o Telegram approval. Sirve para probar el flujo manualmente o para resincronizar si el loop no estuvo corriendo.
 
+`python main.py trello-reply-sync --limit 50`
+
+Lee comentarios recientes de Trello y procesa el comentario mas nuevo que empiece con `Responder:` para mandar ese texto al thread original de Slack.
+
 `python main.py trello-waiting-sync --limit 50`
 
 Lee comentarios recientes de Trello y procesa el comentario mas nuevo que empiece con `Pedir:` para iniciar un ciclo `waiting_for_requester`.
@@ -242,6 +266,18 @@ Lee comentarios recientes de Trello y procesa el comentario mas nuevo que empiec
 Lee comandos pendientes del bot de Telegram y procesa `/send`, `/edit` y `/nosend`. Es util para probar aprobaciones manualmente o para destrabar mensajes si queres correr Telegram por separado.
 
 Las respuestas finales no se envian automaticamente cuando `FINAL_REPLY_MODE=telegram_approval`. Con `FINAL_REPLY_MODE=slack_auto`, el check nativo de Trello envia el cierre directo a Slack.
+
+## Imagenes y archivos visuales
+
+Si alguien manda una captura o imagen por Slack, el agente puede registrarla y dejarla visible en Trello junto con la card del pedido.
+
+- `SLACK_IMAGE_ATTACHMENTS_ENABLED=true` habilita deteccion de archivos visuales.
+- `TRELLO_ATTACH_SLACK_IMAGES=true` intenta llevarlos a la card.
+- `TRELLO_IMAGE_ATTACHMENT_MODE=upload` descarga el archivo privado desde Slack y lo sube como attachment a Trello.
+- `TRELLO_IMAGE_ATTACHMENT_MODE=link` no descarga nada: deja comentario con filename, file id y URL privada.
+- `SLACK_IMAGE_KEEP_FILES=false` borra la copia local despues de adjuntarla.
+
+Para `upload`, el token de Slack necesita `files:read`. Si falla la descarga o la subida a Trello, el agente deja auditoria en SQLite, comenta el problema en la card cuando puede y sigue procesando el pedido.
 
 ## Worker de sync
 
@@ -254,6 +290,7 @@ Las respuestas finales no se envian automaticamente cuando `FINAL_REPLY_MODE=tel
 El worker de sync ejecuta en loop:
 
 ```bash
+python main.py trello-reply-sync --limit 50
 python main.py trello-waiting-sync --limit 50
 python main.py trello-done-sync --limit 50
 python main.py telegram-poll --limit 20

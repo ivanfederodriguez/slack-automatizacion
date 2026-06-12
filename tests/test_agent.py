@@ -119,8 +119,9 @@ class FakeSlackClient:
 
 
 class FakeTrelloClient:
-    def __init__(self, should_fail=False, card_state=None, card_comments=None):
+    def __init__(self, should_fail=False, card_state=None, card_comments=None, attachment_error=None):
         self.should_fail = should_fail
+        self.attachment_error = attachment_error
         self.card_state = card_state or TrelloCardState(
             id="card123",
             name="Test card",
@@ -132,6 +133,8 @@ class FakeTrelloClient:
         self.card_comments = list(card_comments or [])
         self.created_cards = []
         self.comments = []
+        self.file_attachments = []
+        self.url_attachments = []
 
     def get_me(self):
         return {"fullName": "Ivan Rodriguez", "username": "ivan"}
@@ -159,6 +162,22 @@ class FakeTrelloClient:
         if self.should_fail:
             raise RuntimeError("trello down")
         self.comments.append({"card_id": card_id, "text": text})
+
+    def attach_file_to_card(self, card_id, file_path, name=None):
+        if self.should_fail:
+            raise RuntimeError("trello down")
+        if self.attachment_error is not None:
+            raise self.attachment_error
+        self.file_attachments.append({"card_id": card_id, "file_path": file_path, "name": name})
+        return f"att-{len(self.file_attachments)}"
+
+    def add_url_attachment_to_card(self, card_id, url, name=None):
+        if self.should_fail:
+            raise RuntimeError("trello down")
+        if self.attachment_error is not None:
+            raise self.attachment_error
+        self.url_attachments.append({"card_id": card_id, "url": url, "name": name})
+        return f"url-{len(self.url_attachments)}"
 
 
 class FakeTelegramClient:
@@ -232,12 +251,37 @@ def get_task_events(db_path, event_type=None):
         return conn.execute("SELECT * FROM task_events ORDER BY id ASC").fetchall()
 
 
+def get_processed_actions(db_path):
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT * FROM trello_processed_actions ORDER BY id ASC").fetchall()
+
+
+def get_file_rows(db_path):
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT * FROM slack_file_attachments ORDER BY id ASC").fetchall()
+
+
 def audio_file(**overrides):
     payload = {
         "id": "F1",
         "name": "audio.m4a",
         "mimetype": "audio/mp4",
         "url_private_download": "https://files.slack.test/audio.m4a",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def image_file(**overrides):
+    payload = {
+        "id": "IMG1",
+        "name": "captura.png",
+        "mimetype": "image/png",
+        "filetype": "png",
+        "url_private_download": "https://files.slack.test/captura.png",
+        "size": 2048,
     }
     payload.update(overrides)
     return payload
@@ -936,6 +980,288 @@ def test_audio_missing_local_whisper_dependency_is_audited_and_does_not_break(tm
     assert count_tasks(app.config.db_path) == 0
 
 
+def test_detect_visual_attachment_accepts_png(tmp_path):
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        sleep_fn=lambda _: None,
+    )
+
+    attachments = app.detect_visual_attachments({"channel": "D1", "ts": "1.0", "files": [image_file()]})
+
+    assert len(attachments) == 1
+    assert attachments[0].mime_type == "image/png"
+
+
+def test_detect_visual_attachment_accepts_jpeg(tmp_path):
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        sleep_fn=lambda _: None,
+    )
+
+    attachments = app.detect_visual_attachments(
+        {"channel": "D1", "ts": "1.0", "files": [image_file(mimetype="image/jpeg", filetype="jpg", name="foto.jpg")]}
+    )
+
+    assert len(attachments) == 1
+    assert attachments[0].filename == "foto.jpg"
+
+
+def test_detect_visual_attachment_ignores_non_images(tmp_path):
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        sleep_fn=lambda _: None,
+    )
+
+    attachments = app.detect_visual_attachments(
+        {"channel": "D1", "ts": "1.0", "files": [{"id": "DOC1", "name": "archivo.txt", "mimetype": "text/plain"}]}
+    )
+
+    assert attachments == []
+
+
+def test_new_trello_card_uploads_slack_image_attachment(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_trello = FakeTrelloClient()
+    app = AgentApp(
+        make_config(
+            tmp_path,
+            TRELLO_ENABLED="true",
+            TRELLO_API_KEY="key",
+            TRELLO_TOKEN="token",
+            TRELLO_LIST_ID="list123",
+        ),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    downloaded = tmp_path / "captura.png"
+    downloaded.write_bytes(b"png")
+    app.download_visual_attachment = lambda attachment: downloaded
+
+    app.process_message(
+        {
+            "ts": "2.96",
+            "text": "Revisás esta captura con el error?",
+            "user": "UOTHER",
+            "files": [image_file()],
+        },
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    rows = get_file_rows(app.config.db_path)
+    assert len(fake_trello.created_cards) == 1
+    assert len(fake_trello.file_attachments) == 1
+    assert rows[0]["attachment_status"] == "attached"
+    assert rows[0]["trello_card_id"] == "card123"
+    assert any("Imagen adjuntada desde Slack: captura.png" in comment["text"] for comment in fake_trello.comments)
+    assert downloaded.exists() is False
+
+
+def test_context_image_attaches_to_existing_trello_card(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_trello = FakeTrelloClient()
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(
+            tmp_path,
+            TRELLO_ENABLED="true",
+            TRELLO_API_KEY="key",
+            TRELLO_TOKEN="token",
+            TRELLO_LIST_ID="list123",
+        ),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: fake_model,
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    downloaded = tmp_path / "captura-contexto.png"
+    downloaded.write_bytes(b"png")
+    app.download_visual_attachment = lambda attachment: downloaded
+    conversation = {"id": "D123", "is_im": True, "user": "UOTHER"}
+
+    app.process_message(
+        {"ts": "2.97", "text": "Revisás este error?", "user": "UOTHER"},
+        conversation,
+        my_user_id="UME",
+    )
+    app.process_message(
+        {
+            "ts": "2.98",
+            "thread_ts": "2.97",
+            "text": "Te dejo la captura.",
+            "user": "UOTHER",
+            "files": [image_file(id="IMG2", name="detalle.png")],
+        },
+        conversation,
+        my_user_id="UME",
+    )
+
+    rows = get_file_rows(app.config.db_path)
+    assert count_tasks(app.config.db_path) == 1
+    assert len(fake_trello.file_attachments) == 1
+    assert rows[0]["attachment_status"] == "attached"
+    assert fake_trello.file_attachments[0]["card_id"] == "card123"
+
+
+def test_visual_attachment_download_failure_is_audited_without_breaking(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_trello = FakeTrelloClient()
+    app = AgentApp(
+        make_config(
+            tmp_path,
+            TRELLO_ENABLED="true",
+            TRELLO_API_KEY="key",
+            TRELLO_TOKEN="token",
+            TRELLO_LIST_ID="list123",
+        ),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    app.download_visual_attachment = lambda attachment: (_ for _ in ()).throw(RuntimeError("download failed"))
+
+    app.process_message(
+        {
+            "ts": "2.99",
+            "text": "Revisás esta captura con el error?",
+            "user": "UOTHER",
+            "files": [image_file(id="IMG3")],
+        },
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    rows = get_file_rows(app.config.db_path)
+    assert count_tasks(app.config.db_path) == 1
+    assert rows[0]["attachment_status"] == "failed"
+    assert rows[0]["attachment_error"] == "download failed"
+
+
+def test_visual_attachment_trello_upload_failure_is_audited_without_breaking(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_trello = FakeTrelloClient(attachment_error=RuntimeError("trello attach down"))
+    app = AgentApp(
+        make_config(
+            tmp_path,
+            TRELLO_ENABLED="true",
+            TRELLO_API_KEY="key",
+            TRELLO_TOKEN="token",
+            TRELLO_LIST_ID="list123",
+        ),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    downloaded = tmp_path / "captura-falla.png"
+    downloaded.write_bytes(b"png")
+    app.download_visual_attachment = lambda attachment: downloaded
+
+    app.process_message(
+        {
+            "ts": "3.01",
+            "text": "Revisás esta captura con el error?",
+            "user": "UOTHER",
+            "files": [image_file(id="IMG4")],
+        },
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    rows = get_file_rows(app.config.db_path)
+    assert count_tasks(app.config.db_path) == 1
+    assert rows[0]["attachment_status"] == "failed"
+    assert rows[0]["attachment_error"] == "trello attach down"
+    assert any("No pude adjuntar la imagen desde Slack" in comment["text"] for comment in fake_trello.comments)
+
+
+def test_visual_attachment_sync_does_not_duplicate_existing_attachment(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_trello = FakeTrelloClient()
+    app = AgentApp(
+        make_config(
+            tmp_path,
+            TRELLO_ENABLED="true",
+            TRELLO_API_KEY="key",
+            TRELLO_TOKEN="token",
+            TRELLO_LIST_ID="list123",
+        ),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    downloaded = tmp_path / "captura-dup.png"
+    downloaded.write_bytes(b"png")
+    app.download_visual_attachment = lambda attachment: downloaded
+
+    app.process_message(
+        {
+            "ts": "3.02",
+            "text": "Revisás esta captura con el error?",
+            "user": "UOTHER",
+            "files": [image_file(id="IMG5")],
+        },
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    assert app.sync_visual_attachments_for_task(1, "card123") == 0
+    assert len(fake_trello.file_attachments) == 1
+
+
+def test_visual_attachment_link_mode_comments_metadata_without_downloading(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_trello = FakeTrelloClient()
+    app = AgentApp(
+        make_config(
+            tmp_path,
+            TRELLO_ENABLED="true",
+            TRELLO_API_KEY="key",
+            TRELLO_TOKEN="token",
+            TRELLO_LIST_ID="list123",
+            TRELLO_IMAGE_ATTACHMENT_MODE="link",
+        ),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    app.download_visual_attachment = lambda attachment: (_ for _ in ()).throw(AssertionError("no debería descargar"))
+
+    app.process_message(
+        {
+            "ts": "3.03",
+            "text": "Revisás esta captura con el error?",
+            "user": "UOTHER",
+            "files": [image_file(id="IMG6")],
+        },
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    rows = get_file_rows(app.config.db_path)
+    assert rows[0]["attachment_status"] == "linked"
+    assert fake_trello.file_attachments == []
+    assert any("Imagen recibida desde Slack: captura.png" in comment["text"] for comment in fake_trello.comments)
+    assert any("URL privada:" in comment["text"] for comment in fake_trello.comments)
+
+
 def test_channel_without_mention_is_ignored(tmp_path):
     fake_model = FakeStructuredModel([])
     app = AgentApp(
@@ -1194,6 +1520,237 @@ def test_trello_waiting_comment_mentions_requester_in_private_channel(tmp_path):
     assert app.sync_trello_waiting_requests() == 1
 
     assert fake_slack.post_calls[0]["text"].startswith("<@UOTHER> Para poder avanzar")
+
+
+def test_trello_reply_comment_sends_exact_text_to_slack(tmp_path):
+    fake_slack = FakeSlackClient()
+    fake_trello = FakeTrelloClient(
+        card_comments=[
+            TrelloComment(
+                id="reply1",
+                text="Responder: Te paso el link correcto: https://example.com",
+                date="2026-06-11T12:05:00.000Z",
+            )
+        ]
+    )
+    app = AgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="49.15",
+        summary="Mandar link",
+        public_request_text="Mandar el link correcto al requester.",
+        requested_action="Mandar el link correcto.",
+        priority="medium",
+        category="admin",
+        classification=make_classification(summary="Mandar link"),
+        trello_card_id="card123",
+    )
+
+    assert app.sync_trello_reply_commands() == 1
+    assert fake_slack.post_calls[0]["text"] == "Te paso el link correcto: https://example.com"
+    assert get_task(app.config.db_path)["status"] == "new"
+    assert fake_trello.comments[-1]["text"] == "Respuesta enviada a Slack."
+    actions = get_processed_actions(app.config.db_path)
+    assert actions[0]["trello_action_id"] == "reply1"
+    assert actions[0]["status"] == "processed"
+
+
+def test_trello_reply_multiline_preserves_newlines(tmp_path):
+    fake_slack = FakeSlackClient()
+    fake_trello = FakeTrelloClient(
+        card_comments=[
+            TrelloComment(
+                id="reply2",
+                text="Responder:\nTe paso el link correcto: https://example.com\n\nAvisame si te sigue fallando.",
+                date="2026-06-11T12:05:00.000Z",
+            )
+        ]
+    )
+    app = AgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="49.16",
+        summary="Mandar link",
+        requested_action="Mandar link correcto.",
+        priority="medium",
+        category="admin",
+        classification=make_classification(summary="Mandar link"),
+        trello_card_id="card123",
+    )
+
+    assert app.sync_trello_reply_commands() == 1
+    assert fake_slack.post_calls[0]["text"] == (
+        "Te paso el link correcto: https://example.com\n\nAvisame si te sigue fallando."
+    )
+
+
+def test_trello_reply_sync_dedupes_processed_comment(tmp_path):
+    fake_slack = FakeSlackClient()
+    fake_trello = FakeTrelloClient(
+        card_comments=[
+            TrelloComment(
+                id="reply3",
+                text="Responder: Ya te lo mandé por acá.",
+                date="2026-06-11T12:05:00.000Z",
+            )
+        ]
+    )
+    app = AgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="49.17",
+        summary="Responder rápido",
+        requested_action="Responder rápido.",
+        priority="medium",
+        category="communications",
+        classification=make_classification(summary="Responder rápido"),
+        trello_card_id="card123",
+    )
+
+    assert app.sync_trello_reply_commands() == 1
+    assert app.sync_trello_reply_commands() == 0
+    assert len(fake_slack.post_calls) == 1
+
+
+def test_trello_reply_can_mark_task_responded_if_enabled(tmp_path):
+    fake_slack = FakeSlackClient()
+    fake_trello = FakeTrelloClient(
+        card_comments=[
+            TrelloComment(
+                id="reply4",
+                text="Responder: Ya quedó enviado.",
+                date="2026-06-11T12:05:00.000Z",
+            )
+        ]
+    )
+    app = AgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_REPLY_MARK_RESPONDED="true"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="49.18",
+        summary="Responder rápido",
+        requested_action="Responder rápido.",
+        priority="medium",
+        category="communications",
+        classification=make_classification(summary="Responder rápido"),
+        trello_card_id="card123",
+    )
+
+    assert app.sync_trello_reply_commands() == 1
+    task = get_task(app.config.db_path)
+    assert task["status"] == "responded"
+    assert task["reply_ts"] == "50.123456"
+
+
+def test_trello_reply_failure_is_audited_and_comments_back_in_trello(tmp_path):
+    fake_slack = FakeSlackClient(post_error=RuntimeError("slack down"))
+    fake_trello = FakeTrelloClient(
+        card_comments=[
+            TrelloComment(
+                id="reply5",
+                text="Responder: Te lo mando ahora.",
+                date="2026-06-11T12:05:00.000Z",
+            )
+        ]
+    )
+    app = AgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="49.19",
+        summary="Responder rápido",
+        requested_action="Responder rápido.",
+        priority="medium",
+        category="communications",
+        classification=make_classification(summary="Responder rápido"),
+        trello_card_id="card123",
+    )
+
+    assert app.sync_trello_reply_commands() == 0
+    task = get_task(app.config.db_path)
+    assert task["status"] == "new"
+    assert task["trello_last_error"] == "slack down"
+    assert any("No pude enviar la respuesta a Slack: slack down" in comment["text"] for comment in fake_trello.comments)
+    actions = get_processed_actions(app.config.db_path)
+    assert actions[0]["status"] == "failed"
+
+
+def test_trello_reply_in_channel_does_not_add_automatic_mention(tmp_path):
+    fake_slack = FakeSlackClient()
+    fake_trello = FakeTrelloClient(
+        card_comments=[
+            TrelloComment(
+                id="reply6",
+                text="Responder: Te paso el dato por acá.",
+                date="2026-06-11T12:05:00.000Z",
+            )
+        ]
+    )
+    app = AgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="49.20",
+        summary="Responder en canal",
+        requested_action="Responder en canal.",
+        priority="medium",
+        category="communications",
+        classification=make_classification(summary="Responder en canal"),
+        sender_label="Ana Gomez",
+        conversation_label="#ventas",
+        trello_card_id="card123",
+    )
+    with sqlite3.connect(app.config.db_path) as conn:
+        conn.execute("UPDATE tasks SET channel_id = 'G123', requester_user_id = 'UOTHER' WHERE id = 1")
+
+    assert app.sync_trello_reply_commands() == 1
+    assert fake_slack.post_calls[0]["text"] == "Te paso el dato por acá."
+    assert "<@UOTHER>" not in fake_slack.post_calls[0]["text"]
 
 
 def test_waiting_requester_reply_clears_waiting_and_adds_context(tmp_path):
@@ -2056,6 +2613,12 @@ def test_case_grouping_and_sync_worker_config_defaults(tmp_path):
     assert config.trello_waiting_enabled is True
     assert config.trello_waiting_comment_prefix == "Pedir:"
     assert config.trello_waiting_auto_clear is True
+    assert config.trello_reply_enabled is True
+    assert config.trello_reply_comment_prefix == "Responder:"
+    assert config.trello_reply_mark_responded is False
+    assert config.slack_image_attachments_enabled is True
+    assert config.trello_attach_slack_images is True
+    assert config.trello_image_attachment_mode == "upload"
     assert config.sync_worker_seconds == 60
     assert config.sync_waiting_enabled is True
     assert config.sync_trello_done_enabled is True
@@ -2091,6 +2654,21 @@ def test_doctor_warns_when_slack_auto_final_replies_are_enabled(tmp_path, capsys
     output = capsys.readouterr().out
     assert "FINAL_REPLY_MODE=slack_auto" in output
     assert "directo a Slack" in output
+
+
+def test_doctor_warns_about_slack_files_read_for_visual_attachments(tmp_path, capsys):
+    app = AgentApp(
+        make_config(tmp_path, LOCAL_WHISPER_ENABLED="false", TRELLO_ENABLED="false"),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([DoctorResult()]),
+        sleep_fn=lambda _: None,
+    )
+
+    assert app.doctor() is True
+
+    output = capsys.readouterr().out
+    assert "files:read" in output
+    assert "imágenes de Slack" in output
 
 
 def test_doctor_warns_when_local_whisper_enabled_without_backend(tmp_path, capsys, monkeypatch):
@@ -2171,6 +2749,12 @@ def test_main_parser_accepts_trello_waiting_sync_command():
     args = build_parser().parse_args(["trello-waiting-sync", "--limit", "7"])
     assert args.command == "trello-waiting-sync"
     assert args.limit == 7
+
+
+def test_main_parser_accepts_trello_reply_sync_command():
+    args = build_parser().parse_args(["trello-reply-sync", "--limit", "9"])
+    assert args.command == "trello-reply-sync"
+    assert args.limit == 9
 
 
 def test_transcribe_audio_path_uses_injected_transcriber(tmp_path):

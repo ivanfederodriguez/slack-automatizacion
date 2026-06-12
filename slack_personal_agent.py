@@ -51,6 +51,16 @@ DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 MAX_MESSAGE_LINKS = 5
 MAX_PUBLIC_PREVIEW_BYTES = 65536
+MAX_SLACK_MESSAGE_LENGTH = 40000
+VISUAL_IMAGE_SUFFIXES = {
+    "gif",
+    "heic",
+    "heif",
+    "jpeg",
+    "jpg",
+    "png",
+    "webp",
+}
 
 
 class ConfigError(RuntimeError):
@@ -142,6 +152,20 @@ class AudioTranscriptFusion(BaseModel):
     transcript: str
 
 
+@dataclass(frozen=True)
+class SlackVisualAttachment:
+    source_message_id: str
+    channel_id: str
+    message_ts: str
+    file_id: str
+    filename: str
+    mime_type: str
+    filetype: str
+    url_private: str
+    index: int = 0
+    size_bytes: int = 0
+
+
 class AgentState(TypedDict, total=False):
     message: dict[str, Any]
     conversation: dict[str, Any]
@@ -185,6 +209,12 @@ class TrelloClientProtocol(Protocol):
         ...
 
     def get_card_comments(self, card_id: str, limit: int = 50) -> list[TrelloComment]:
+        ...
+
+    def attach_file_to_card(self, card_id: str, file_path: Path, name: Optional[str] = None) -> str:
+        ...
+
+    def add_url_attachment_to_card(self, card_id: str, url: str, name: Optional[str] = None) -> str:
         ...
 
 
@@ -299,6 +329,9 @@ class AgentConfig:
     trello_waiting_enabled: bool = True
     trello_waiting_comment_prefix: str = "Pedir:"
     trello_waiting_auto_clear: bool = True
+    trello_reply_enabled: bool = True
+    trello_reply_comment_prefix: str = "Responder:"
+    trello_reply_mark_responded: bool = False
     telegram_enabled: bool = False
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
@@ -315,6 +348,12 @@ class AgentConfig:
     local_whisper_cache_dir: str = "~/Library/Application Support/slack-personal-agent/audio"
     audio_transcript_fusion_enabled: bool = True
     audio_transcript_fusion_model: str = "main"
+    slack_image_attachments_enabled: bool = True
+    trello_attach_slack_images: bool = True
+    trello_image_attachment_mode: Literal["upload", "link"] = "upload"
+    slack_image_keep_files: bool = False
+    slack_image_cache_dir: str = "~/Library/Application Support/slack-personal-agent/images"
+    slack_image_max_bytes: int = 15000000
     sync_worker_seconds: int = 60
     sync_waiting_enabled: bool = True
     sync_trello_done_enabled: bool = True
@@ -341,6 +380,10 @@ class AgentConfig:
         final_reply_mode = (get("FINAL_REPLY_MODE", "telegram_approval") or "telegram_approval").strip().lower()
         if final_reply_mode not in {"telegram_approval", "slack_auto"}:
             raise ConfigError("FINAL_REPLY_MODE debe ser telegram_approval o slack_auto.")
+
+        trello_image_attachment_mode = (get("TRELLO_IMAGE_ATTACHMENT_MODE", "upload") or "upload").strip().lower()
+        if trello_image_attachment_mode not in {"upload", "link"}:
+            raise ConfigError("TRELLO_IMAGE_ATTACHMENT_MODE debe ser upload o link.")
 
         poll_seconds_raw = (get("POLL_SECONDS", "300") or "300").strip()
         sleep_seconds_raw = (get("SLACK_SLEEP_SECONDS", "1.2") or "1.2").strip()
@@ -378,6 +421,14 @@ class AgentConfig:
             local_whisper_max_seconds = int(max_audio_seconds_raw)
         except ValueError as exc:
             raise ConfigError("LOCAL_WHISPER_MAX_SECONDS debe ser un entero.") from exc
+
+        slack_image_max_bytes_raw = (get("SLACK_IMAGE_MAX_BYTES", "15000000") or "15000000").strip()
+        try:
+            slack_image_max_bytes = int(slack_image_max_bytes_raw)
+        except ValueError as exc:
+            raise ConfigError("SLACK_IMAGE_MAX_BYTES debe ser un entero.") from exc
+        if slack_image_max_bytes <= 0:
+            raise ConfigError("SLACK_IMAGE_MAX_BYTES debe ser mayor a 0.")
 
         mention_aliases = tuple(
             alias
@@ -437,6 +488,9 @@ class AgentConfig:
             trello_waiting_enabled=parse_bool(get("TRELLO_WAITING_ENABLED", "true") or "true"),
             trello_waiting_comment_prefix=(get("TRELLO_WAITING_COMMENT_PREFIX", "Pedir:") or "Pedir:").strip(),
             trello_waiting_auto_clear=parse_bool(get("TRELLO_WAITING_AUTO_CLEAR", "true") or "true"),
+            trello_reply_enabled=parse_bool(get("TRELLO_REPLY_ENABLED", "true") or "true"),
+            trello_reply_comment_prefix=(get("TRELLO_REPLY_COMMENT_PREFIX", "Responder:") or "Responder:").strip(),
+            trello_reply_mark_responded=parse_bool(get("TRELLO_REPLY_MARK_RESPONDED", "false") or "false"),
             telegram_enabled=parse_bool(get("TELEGRAM_ENABLED", "false") or "false"),
             telegram_bot_token=(get("TELEGRAM_BOT_TOKEN", "") or "").strip(),
             telegram_chat_id=(get("TELEGRAM_CHAT_ID", "") or "").strip(),
@@ -459,6 +513,18 @@ class AgentConfig:
             ).strip(),
             audio_transcript_fusion_enabled=parse_bool(get("AUDIO_TRANSCRIPT_FUSION_ENABLED", "true") or "true"),
             audio_transcript_fusion_model=(get("AUDIO_TRANSCRIPT_FUSION_MODEL", "main") or "main").strip(),
+            slack_image_attachments_enabled=parse_bool(get("SLACK_IMAGE_ATTACHMENTS_ENABLED", "true") or "true"),
+            trello_attach_slack_images=parse_bool(get("TRELLO_ATTACH_SLACK_IMAGES", "true") or "true"),
+            trello_image_attachment_mode=trello_image_attachment_mode,  # type: ignore[arg-type]
+            slack_image_keep_files=parse_bool(get("SLACK_IMAGE_KEEP_FILES", "false") or "false"),
+            slack_image_cache_dir=(
+                get(
+                    "SLACK_IMAGE_CACHE_DIR",
+                    "~/Library/Application Support/slack-personal-agent/images",
+                )
+                or "~/Library/Application Support/slack-personal-agent/images"
+            ).strip(),
+            slack_image_max_bytes=slack_image_max_bytes,
             sync_worker_seconds=sync_worker_seconds,
             sync_waiting_enabled=parse_bool(get("SYNC_WAITING_ENABLED", "true") or "true"),
             sync_trello_done_enabled=parse_bool(get("SYNC_TRELLO_DONE_ENABLED", "true") or "true"),
@@ -657,6 +723,47 @@ class AgentApp:
                 """
             )
 
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trello_processed_actions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL,
+                    trello_card_id TEXT NOT NULL,
+                    trello_action_id TEXT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    command_prefix TEXT NOT NULL,
+                    command_text TEXT,
+                    processed_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    FOREIGN KEY(task_id) REFERENCES tasks(id)
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS slack_file_attachments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER,
+                    channel_id TEXT NOT NULL,
+                    message_ts TEXT NOT NULL,
+                    file_id TEXT NOT NULL,
+                    filename TEXT,
+                    mime_type TEXT,
+                    filetype TEXT,
+                    url_private TEXT,
+                    local_path TEXT,
+                    trello_card_id TEXT,
+                    trello_attachment_id TEXT,
+                    attachment_status TEXT NOT NULL,
+                    attachment_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
             self._ensure_column(conn, "processed_messages", "updated_at", "updated_at TEXT NOT NULL DEFAULT ''")
             self._ensure_column(
                 conn,
@@ -798,6 +905,24 @@ class AgentApp:
             )
             conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_trello_processed_actions_action
+                ON trello_processed_actions(trello_action_id, command_prefix, status)
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_slack_file_attachments_message_file
+                ON slack_file_attachments(channel_id, message_ts, file_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_slack_file_attachments_task
+                ON slack_file_attachments(task_id, trello_card_id, attachment_status)
+                """
+            )
+            conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_task_events_task
                 ON task_events(task_id, created_at)
                 """
@@ -834,6 +959,64 @@ class AgentApp:
                     json.dumps(details or {}, ensure_ascii=False, sort_keys=True),
                 ),
             )
+
+    def record_trello_processed_action(
+        self,
+        *,
+        task_id: int,
+        trello_card_id: str,
+        trello_action_id: str,
+        action_type: str,
+        command_prefix: str,
+        command_text: str,
+        status: str,
+        error: str = "",
+    ) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO trello_processed_actions (
+                    task_id,
+                    trello_card_id,
+                    trello_action_id,
+                    action_type,
+                    command_prefix,
+                    command_text,
+                    processed_at,
+                    status,
+                    error
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    trello_card_id,
+                    trello_action_id,
+                    action_type,
+                    command_prefix,
+                    command_text,
+                    now_iso(),
+                    status,
+                    error[:1000],
+                ),
+            )
+
+    def trello_action_already_processed(self, trello_action_id: str, command_prefix: str) -> bool:
+        if not trello_action_id:
+            return False
+        with self.db_connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM trello_processed_actions
+                WHERE trello_action_id = ?
+                  AND command_prefix = ?
+                  AND status = 'processed'
+                LIMIT 1
+                """,
+                (trello_action_id, command_prefix),
+            ).fetchone()
+        return row is not None
 
     def get_agent_state(self, key: str) -> Optional[str]:
         with self.db_connect() as conn:
@@ -1148,6 +1331,319 @@ Reglas:
         for path in sorted(item for item in folder_path.iterdir() if item.is_file()):
             results.append((path, self.transcribe_audio_path(path)))
         return results
+
+    def image_cache_dir(self) -> Path:
+        return Path(self.config.slack_image_cache_dir).expanduser()
+
+    def is_visual_file(self, file_payload: dict[str, Any]) -> bool:
+        mimetype = str(file_payload.get("mimetype") or "").lower()
+        if mimetype.startswith("image/"):
+            return True
+        filetype = str(file_payload.get("filetype") or "").lower()
+        if filetype in VISUAL_IMAGE_SUFFIXES:
+            return True
+        name = str(file_payload.get("name") or file_payload.get("title") or "").lower()
+        suffix = Path(name).suffix.lstrip(".")
+        return suffix in VISUAL_IMAGE_SUFFIXES
+
+    def detect_visual_attachments(self, message: dict[str, Any]) -> list[SlackVisualAttachment]:
+        channel_id = str(message.get("channel") or message.get("channel_id") or "")
+        message_ts = str(message.get("ts") or "")
+        attachments: list[SlackVisualAttachment] = []
+        for index, file_payload in enumerate(message.get("files") or [], start=1):
+            if not isinstance(file_payload, dict) or not self.is_visual_file(file_payload):
+                continue
+            file_id = str(file_payload.get("id") or file_payload.get("file_id") or f"image-{index}")
+            filename = str(file_payload.get("name") or file_payload.get("title") or file_id)
+            size_bytes = int(file_payload.get("size") or 0)
+            attachments.append(
+                SlackVisualAttachment(
+                    source_message_id=f"{channel_id}:{message_ts}",
+                    channel_id=channel_id,
+                    message_ts=message_ts,
+                    file_id=file_id,
+                    filename=filename,
+                    mime_type=str(file_payload.get("mimetype") or ""),
+                    filetype=str(file_payload.get("filetype") or ""),
+                    url_private=str(
+                        file_payload.get("url_private_download")
+                        or file_payload.get("url_private")
+                        or ""
+                    ),
+                    index=index,
+                    size_bytes=size_bytes,
+                )
+            )
+        return attachments
+
+    def save_visual_attachment_metadata(
+        self,
+        attachment: SlackVisualAttachment,
+        *,
+        task_id: Optional[int] = None,
+    ) -> None:
+        timestamp = now_iso()
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO slack_file_attachments (
+                    task_id,
+                    channel_id,
+                    message_ts,
+                    file_id,
+                    filename,
+                    mime_type,
+                    filetype,
+                    url_private,
+                    local_path,
+                    trello_card_id,
+                    trello_attachment_id,
+                    attachment_status,
+                    attachment_error,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'detected', NULL, ?, ?)
+                ON CONFLICT(channel_id, message_ts, file_id) DO UPDATE SET
+                    task_id = COALESCE(excluded.task_id, slack_file_attachments.task_id),
+                    filename = excluded.filename,
+                    mime_type = excluded.mime_type,
+                    filetype = excluded.filetype,
+                    url_private = excluded.url_private,
+                    attachment_status = CASE
+                        WHEN slack_file_attachments.attachment_status IN ('attached', 'linked')
+                            THEN slack_file_attachments.attachment_status
+                        ELSE 'detected'
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    task_id,
+                    attachment.channel_id,
+                    attachment.message_ts,
+                    attachment.file_id,
+                    attachment.filename,
+                    attachment.mime_type,
+                    attachment.filetype,
+                    attachment.url_private,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+    def annotate_message_with_visual_attachments(
+        self,
+        message: dict[str, Any],
+        conversation: dict[str, Any],
+        *,
+        task_id: Optional[int] = None,
+    ) -> dict[str, Any]:
+        if not self.config.slack_image_attachments_enabled:
+            return message
+
+        enriched_message = dict(message)
+        enriched_message.setdefault("channel", conversation.get("id", ""))
+        attachments = self.detect_visual_attachments(enriched_message)
+        if not attachments:
+            return enriched_message
+
+        for attachment in attachments:
+            self.save_visual_attachment_metadata(attachment, task_id=task_id)
+        enriched_message["_visual_attachments"] = attachments
+        return enriched_message
+
+    def assign_visual_attachments_to_task(self, channel_id: str, message_ts: str, task_id: int) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE slack_file_attachments
+                SET task_id = ?,
+                    updated_at = ?
+                WHERE channel_id = ?
+                  AND message_ts = ?
+                  AND task_id IS NULL
+                """,
+                (task_id, now_iso(), channel_id, message_ts),
+            )
+
+    def update_visual_attachment_row(
+        self,
+        *,
+        channel_id: str,
+        message_ts: str,
+        file_id: str,
+        status: str,
+        local_path: str = "",
+        trello_card_id: str = "",
+        trello_attachment_id: str = "",
+        error: str = "",
+    ) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE slack_file_attachments
+                SET local_path = CASE WHEN ? != '' THEN ? ELSE local_path END,
+                    trello_card_id = CASE WHEN ? != '' THEN ? ELSE trello_card_id END,
+                    trello_attachment_id = CASE WHEN ? != '' THEN ? ELSE trello_attachment_id END,
+                    attachment_status = ?,
+                    attachment_error = ?,
+                    updated_at = ?
+                WHERE channel_id = ?
+                  AND message_ts = ?
+                  AND file_id = ?
+                """,
+                (
+                    local_path,
+                    local_path,
+                    trello_card_id,
+                    trello_card_id,
+                    trello_attachment_id,
+                    trello_attachment_id,
+                    status,
+                    error[:1000] if error else None,
+                    now_iso(),
+                    channel_id,
+                    message_ts,
+                    file_id,
+                ),
+            )
+
+    def download_visual_attachment(self, attachment: SlackVisualAttachment) -> Path:
+        if not attachment.url_private:
+            raise RuntimeError("La imagen no trae url_private ni url_private_download.")
+        if attachment.size_bytes and attachment.size_bytes > self.config.slack_image_max_bytes:
+            raise RuntimeError(
+                f"La imagen supera SLACK_IMAGE_MAX_BYTES ({attachment.size_bytes} bytes)."
+            )
+
+        cache_dir = self.image_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        suffix = Path(attachment.filename).suffix or ".image"
+        target = cache_dir / f"{attachment.file_id or attachment.index}{suffix}"
+        response = requests.get(
+            attachment.url_private,
+            timeout=(5, 60),
+            headers={"Authorization": f"Bearer {self.config.slack_user_token}"},
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Slack imagen devolvió HTTP {response.status_code}: {response.text[:300]}")
+        if len(response.content) > self.config.slack_image_max_bytes:
+            raise RuntimeError(
+                f"La imagen descargada supera SLACK_IMAGE_MAX_BYTES ({len(response.content)} bytes)."
+            )
+        target.write_bytes(response.content)
+        self.update_visual_attachment_row(
+            channel_id=attachment.channel_id,
+            message_ts=attachment.message_ts,
+            file_id=attachment.file_id,
+            status="downloaded",
+            local_path=str(target),
+        )
+        return target
+
+    def build_visual_attachment_link_comment(self, attachment: SlackVisualAttachment) -> str:
+        return "\n".join(
+            [
+                f"Imagen recibida desde Slack: {attachment.filename}",
+                f"Slack file id: {attachment.file_id}",
+                f"URL privada: {attachment.url_private}",
+                "Puede requerir permisos de Slack para abrirla.",
+            ]
+        )
+
+    def maybe_comment_trello_card(self, card_id: str, text: str) -> None:
+        if not card_id or not text.strip():
+            return
+        try:
+            self.get_trello_client().add_card_comment(card_id, text)
+        except Exception as exc:
+            print(f"[yellow]No pude comentar en Trello {card_id}: {exc}[/yellow]")
+
+    def sync_visual_attachments_for_task(self, task_id: int, card_id: str) -> int:
+        if (
+            not self.config.trello_enabled
+            or not self.config.trello_attach_slack_images
+            or not card_id
+        ):
+            return 0
+
+        with self.db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM slack_file_attachments
+                WHERE task_id = ?
+                ORDER BY id ASC
+                """,
+                (task_id,),
+            ).fetchall()
+
+        attached = 0
+        for row in rows:
+            if row["trello_card_id"] == card_id and row["attachment_status"] in {"attached", "linked"}:
+                continue
+
+            attachment = SlackVisualAttachment(
+                source_message_id=f"{row['channel_id']}:{row['message_ts']}",
+                channel_id=row["channel_id"],
+                message_ts=row["message_ts"],
+                file_id=row["file_id"],
+                filename=row["filename"] or row["file_id"],
+                mime_type=row["mime_type"] or "",
+                filetype=row["filetype"] or "",
+                url_private=row["url_private"] or "",
+            )
+            try:
+                if self.config.trello_image_attachment_mode == "link":
+                    self.maybe_comment_trello_card(card_id, self.build_visual_attachment_link_comment(attachment))
+                    self.update_visual_attachment_row(
+                        channel_id=attachment.channel_id,
+                        message_ts=attachment.message_ts,
+                        file_id=attachment.file_id,
+                        status="linked",
+                        trello_card_id=card_id,
+                    )
+                else:
+                    downloaded_path = self.download_visual_attachment(attachment)
+                    try:
+                        trello_attachment_id = self.get_trello_client().attach_file_to_card(
+                            card_id,
+                            downloaded_path,
+                            name=attachment.filename,
+                        )
+                        self.update_visual_attachment_row(
+                            channel_id=attachment.channel_id,
+                            message_ts=attachment.message_ts,
+                            file_id=attachment.file_id,
+                            status="attached",
+                            local_path=str(downloaded_path) if self.config.slack_image_keep_files else "",
+                            trello_card_id=card_id,
+                            trello_attachment_id=trello_attachment_id,
+                        )
+                        self.maybe_comment_trello_card(card_id, f"Imagen adjuntada desde Slack: {attachment.filename}")
+                    finally:
+                        if downloaded_path.exists() and not self.config.slack_image_keep_files:
+                            downloaded_path.unlink(missing_ok=True)
+                attached += 1
+            except Exception as exc:
+                error_message = str(exc)
+                self.update_visual_attachment_row(
+                    channel_id=attachment.channel_id,
+                    message_ts=attachment.message_ts,
+                    file_id=attachment.file_id,
+                    status="failed",
+                    trello_card_id=card_id,
+                    error=error_message,
+                )
+                self.maybe_comment_trello_card(
+                    card_id,
+                    f"No pude adjuntar la imagen desde Slack: {attachment.filename}. {error_message[:220]}",
+                )
+                print(
+                    f"[yellow]No pude adjuntar imagen Slack para tarea #{task_id} ({attachment.filename}): "
+                    f"{error_message}[/yellow]"
+                )
+        return attached
 
     def slack_call(self, method: Callable[..., Any], **kwargs: Any) -> Any:
         while True:
@@ -1707,6 +2203,13 @@ Reglas:
             return ""
         return text[len(prefix):].strip()
 
+    def reply_command_from_comment(self, comment_text: str) -> str:
+        prefix = self.config.trello_reply_comment_prefix.strip()
+        text = str(comment_text or "").strip()
+        if not prefix or not text.lower().startswith(prefix.lower()):
+            return ""
+        return text[len(prefix):].lstrip()
+
     def build_waiting_request_slack_text(self, task_row: sqlite3.Row, waiting_request_text: str) -> str:
         mention = ""
         requester_user_id = task_row["requester_user_id"] or task_row["user_id"] or ""
@@ -1774,6 +2277,19 @@ Reglas:
             )
         self.record_task_event(task_id, "waiting_request_failed", {"error": error_message[:1000]})
 
+    def mark_task_trello_reply_command_failed(self, task_id: int, error_message: str) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET trello_last_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (error_message[:1000], now_iso(), task_id),
+            )
+        self.record_task_event(task_id, "trello_reply_failed", {"error": error_message[:1000]})
+
     def mark_task_waiting_cleared(self, task_id: int) -> None:
         timestamp = now_iso()
         with self.db_connect() as conn:
@@ -1817,6 +2333,74 @@ Reglas:
             waiting_request_message_ts=str(response.get("ts") or ""),
             waiting_trello_action_id=waiting_trello_action_id,
         )
+        self.record_trello_processed_action(
+            task_id=task_row["id"],
+            trello_card_id=task_row["trello_card_id"] or "",
+            trello_action_id=waiting_trello_action_id,
+            action_type="comment_command",
+            command_prefix=self.config.trello_waiting_comment_prefix,
+            command_text=waiting_request_text,
+            status="processed",
+        )
+        return True
+
+    def send_trello_reply_to_slack(
+        self,
+        task_row: sqlite3.Row,
+        *,
+        reply_text: str,
+        trello_action_id: str,
+    ) -> bool:
+        try:
+            response = self.slack_call(
+                self.slack.chat_postMessage,
+                channel=task_row["channel_id"],
+                thread_ts=task_row["thread_ts"] or task_row["message_ts"],
+                text=reply_text,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+        except Exception as exc:
+            error_message = str(exc)
+            self.mark_task_trello_reply_command_failed(task_row["id"], error_message)
+            self.record_trello_processed_action(
+                task_id=task_row["id"],
+                trello_card_id=task_row["trello_card_id"] or "",
+                trello_action_id=trello_action_id,
+                action_type="comment_command",
+                command_prefix=self.config.trello_reply_comment_prefix,
+                command_text=reply_text,
+                status="failed",
+                error=error_message,
+            )
+            self.maybe_comment_trello_card(
+                task_row["trello_card_id"] or "",
+                f"No pude enviar la respuesta a Slack: {error_message[:220]}",
+            )
+            print(f"[yellow]No pude enviar respuesta Trello->Slack para tarea #{task_row['id']}: {exc}[/yellow]")
+            return False
+
+        reply_ts = str(response.get("ts") or "")
+        self.record_trello_processed_action(
+            task_id=task_row["id"],
+            trello_card_id=task_row["trello_card_id"] or "",
+            trello_action_id=trello_action_id,
+            action_type="comment_command",
+            command_prefix=self.config.trello_reply_comment_prefix,
+            command_text=reply_text,
+            status="processed",
+        )
+        self.record_task_event(
+            task_row["id"],
+            "trello_reply_sent",
+            {
+                "reply_ts": reply_ts,
+                "trello_action_id": trello_action_id,
+            },
+        )
+        self.maybe_comment_trello_card(task_row["trello_card_id"] or "", "Respuesta enviada a Slack.")
+        if self.config.trello_reply_mark_responded and task_row["status"] != "waiting_for_requester":
+            self.mark_task_reply_sent(task_row["id"], reply_ts)
         return True
 
     def mark_task_trello_context_failed(self, task_id: int, error_message: str) -> None:
@@ -1867,6 +2451,8 @@ Reglas:
         conversation_label: str,
     ) -> bool:
         text = (message.get("text") or "").strip()
+        visual_attachments = list(message.get("_visual_attachments") or [])
+        has_visual_context = bool(visual_attachments)
         context_text = ""
         try:
             context_text = self.fetch_recent_context(conversation["id"], message["ts"])
@@ -1887,7 +2473,11 @@ Reglas:
         )
         self.replace_message_links(conversation["id"], message["ts"], links)
 
-        if not self.message_adds_new_context(task_row, text):
+        for attachment in visual_attachments:
+            self.save_visual_attachment_metadata(attachment, task_id=task_row["id"])
+        self.assign_visual_attachments_to_task(conversation["id"], message["ts"], task_row["id"])
+
+        if not has_visual_context and not self.message_adds_new_context(task_row, text):
             self.mark_processed_context_status(
                 channel_id=conversation["id"],
                 message_ts=message["ts"],
@@ -1909,10 +2499,14 @@ Reglas:
                 """,
                 (
                     now_iso(),
-                    self.build_public_request_text(
-                        task_row=task_row,
-                        transcribed_audio=bool(message.get("_audio_transcript_added")),
-                        context_text=text,
+                    (
+                        self.build_public_request_text(
+                            task_row=task_row,
+                            transcribed_audio=bool(message.get("_audio_transcript_added")),
+                            context_text=text,
+                        )
+                        if text
+                        else task_row["public_request_text"]
                     ),
                     task_row["id"],
                 ),
@@ -1926,21 +2520,30 @@ Reglas:
                 "message_ts": message["ts"],
                 "sender_label": sender_label,
                 "text": text,
+                "visual_file_ids": [attachment.file_id for attachment in visual_attachments],
             },
         )
-        self.add_context_to_trello_card(task_row, text, sender_label)
+        if text:
+            self.add_context_to_trello_card(task_row, text, sender_label)
+        if task_row["trello_card_id"]:
+            self.sync_visual_attachments_for_task(task_row["id"], task_row["trello_card_id"])
         self.mark_processed_context_status(
             channel_id=conversation["id"],
             message_ts=message["ts"],
             status="context_added",
             reason=f"Contexto agregado a tarea #{task_row['id']}.",
         )
-        self.send_context_acknowledgement(
-            task_row["id"],
-            summary,
-            transcribed_audio=bool(message.get("_audio_transcript_added")),
-        )
-        if task_row["status"] == "waiting_for_requester" and self.config.trello_waiting_auto_clear:
+        if text:
+            self.send_context_acknowledgement(
+                task_row["id"],
+                summary,
+                transcribed_audio=bool(message.get("_audio_transcript_added")),
+            )
+        if (
+            task_row["status"] == "waiting_for_requester"
+            and self.config.trello_waiting_auto_clear
+            and (text or has_visual_context)
+        ):
             self.mark_task_waiting_cleared(task_row["id"])
         return True
 
@@ -2519,6 +3122,7 @@ Reglas:
             return False
 
         self.mark_task_trello_created(task_row["id"], card)
+        self.sync_visual_attachments_for_task(task_row["id"], card.id)
         print(f"[green]Trello OK:[/green] tarea #{task_row['id']} -> {card.url}")
         return True
 
@@ -2710,6 +3314,67 @@ Reglas:
         self.mark_task_telegram_notified(task_id)
         return True
 
+    def sync_trello_reply_commands(self, limit: int = 50) -> int:
+        if not self.config.trello_enabled or not self.config.trello_reply_enabled:
+            return 0
+
+        with self.db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT tasks.*,
+                       processed_messages.raw_text,
+                       processed_messages.context_text
+                FROM tasks
+                LEFT JOIN processed_messages
+                  ON processed_messages.channel_id = tasks.channel_id
+                 AND processed_messages.message_ts = tasks.message_ts
+                WHERE tasks.trello_card_id IS NOT NULL
+                  AND tasks.trello_card_id != ''
+                  AND COALESCE(tasks.status, 'new') NOT IN (
+                    'done',
+                    'ignored',
+                    'dismissed',
+                    'archived'
+                  )
+                ORDER BY tasks.id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        sent = 0
+        for row in rows:
+            try:
+                comments = self.get_trello_client().get_card_comments(row["trello_card_id"], limit=25)
+            except Exception as exc:
+                self.mark_task_trello_reply_command_failed(row["id"], str(exc))
+                print(f"[yellow]No pude leer comentarios Trello para tarea #{row['id']}: {exc}[/yellow]")
+                continue
+
+            reply_comment = None
+            reply_text = ""
+            for comment in sorted(comments, key=lambda item: item.date or "", reverse=True):
+                text = self.reply_command_from_comment(comment.text)
+                if text and not self.trello_action_already_processed(
+                    comment.id,
+                    self.config.trello_reply_comment_prefix,
+                ):
+                    reply_comment = comment
+                    reply_text = text
+                    break
+
+            if not reply_comment or not reply_text:
+                continue
+
+            if self.send_trello_reply_to_slack(
+                row,
+                reply_text=reply_text,
+                trello_action_id=reply_comment.id,
+            ):
+                sent += 1
+
+        return sent
+
     def sync_trello_waiting_requests(self, limit: int = 50) -> int:
         if not self.config.trello_enabled or not self.config.trello_waiting_enabled:
             return 0
@@ -2762,7 +3427,13 @@ Reglas:
 
             if not waiting_comment or not waiting_text:
                 continue
-            if waiting_comment.id and waiting_comment.id == (row["waiting_trello_action_id"] or ""):
+            if waiting_comment.id and (
+                waiting_comment.id == (row["waiting_trello_action_id"] or "")
+                or self.trello_action_already_processed(
+                    waiting_comment.id,
+                    self.config.trello_waiting_comment_prefix,
+                )
+            ):
                 continue
 
             if self.send_waiting_request_to_slack(
@@ -2917,7 +3588,10 @@ Reglas:
             return False
         if message.get("text"):
             return True
-        return bool(self.config.audio_transcription_enabled and message.get("files"))
+        return bool(
+            message.get("files")
+            and (self.config.audio_transcription_enabled or self.config.slack_image_attachments_enabled)
+        )
 
     def build_classification_prompt(
         self,
@@ -3143,6 +3817,7 @@ Reglas:
             if inserted:
                 task_row = self.get_task_row(conversation["id"], message["ts"])
                 if task_row:
+                    self.assign_visual_attachments_to_task(conversation["id"], message["ts"], task_row["id"])
                     self.send_task_acknowledgement(task_row["id"])
                 if self.config.trello_enabled and self.config.trello_auto_create:
                     self.sync_task_to_trello_by_message(conversation["id"], message["ts"])
@@ -3190,6 +3865,11 @@ Reglas:
             if message.get("user") != my_user_id or self.config.include_self_for_test:
                 existing_case = self.find_existing_case_for_message(message, conversation, sender_label)
 
+            message = self.annotate_message_with_visual_attachments(
+                message,
+                conversation,
+                task_id=existing_case["id"] if existing_case else None,
+            )
             message = self.enrich_message_with_audio(
                 message,
                 conversation,
@@ -3285,6 +3965,7 @@ Reglas:
                     if inserted:
                         task_row = self.get_task_row(row["channel_id"], row["message_ts"])
                         if task_row:
+                            self.assign_visual_attachments_to_task(row["channel_id"], row["message_ts"], task_row["id"])
                             self.send_task_acknowledgement(task_row["id"])
                         if self.config.trello_enabled and self.config.trello_auto_create:
                             self.sync_task_to_trello_by_message(row["channel_id"], row["message_ts"])
@@ -3325,10 +4006,11 @@ Reglas:
         if self.config.trello_enabled and self.config.trello_auto_create:
             self.sync_pending_trello_tasks(limit=25)
         if self.config.trello_enabled:
+            self.sync_trello_reply_commands(limit=25)
             if self.config.sync_waiting_enabled:
                 self.sync_trello_waiting_requests(limit=25)
             self.sync_trello_done_tasks(limit=25)
-        if self.config.final_reply_mode == "telegram_approval":
+        if self.config.sync_telegram_poll_enabled and self.config.final_reply_mode == "telegram_approval":
             self.poll_telegram_updates(limit=25)
         total_new = 0
 
@@ -3377,10 +4059,11 @@ Reglas:
         if self.config.trello_enabled and self.config.trello_auto_create:
             self.sync_pending_trello_tasks(limit=25)
         if self.config.trello_enabled:
+            self.sync_trello_reply_commands(limit=25)
             if self.config.sync_waiting_enabled:
                 self.sync_trello_waiting_requests(limit=25)
             self.sync_trello_done_tasks(limit=25)
-        if self.config.final_reply_mode == "telegram_approval":
+        if self.config.sync_telegram_poll_enabled and self.config.final_reply_mode == "telegram_approval":
             self.poll_telegram_updates(limit=25)
         print(f"[green]Poll terminado.[/green] Mensajes humanos nuevos procesados: {total_new}")
 
@@ -4237,6 +4920,11 @@ Reglas:
                     "[yellow]FINAL_REPLY_MODE=slack_auto está activo: cuando Trello esté marcado "
                     "como hecho, el cierre final se enviará directo a Slack.[/yellow]"
                 )
+            if self.config.slack_image_attachments_enabled and self.config.trello_attach_slack_images:
+                print(
+                    "[yellow]Las imágenes de Slack usan URLs privadas; si querés adjuntarlas a Trello "
+                    "el token necesita poder leer archivos (`files:read`).[/yellow]"
+                )
         except Exception as exc:
             ok = False
             print(f"[red]Slack auth falló:[/red] {exc}")
@@ -4315,8 +5003,8 @@ Reglas:
                     else:
                         ok = False
                         print("[yellow]Falta TRELLO_LIST_ID. Usá `python main.py trello-lists` para descubrirlo.[/yellow]")
-                    if self.config.trello_waiting_enabled:
-                        print("[bold]Chequeo Trello waiting[/bold]")
+                    if self.config.trello_waiting_enabled or self.config.trello_reply_enabled:
+                        print("[bold]Chequeo Trello comentarios[/bold]")
                         with self.db_connect() as conn:
                             sample = conn.execute(
                                 """
@@ -4333,8 +5021,14 @@ Reglas:
                         else:
                             print(
                                 "[yellow]No hay cards locales para probar lectura de comentarios. "
-                                "TRELLO_WAITING_ENABLED requiere token Trello con scope read.[/yellow]"
+                                "Los comandos Trello por comentario requieren token Trello con scope read.[/yellow]"
                             )
+                    if self.config.trello_attach_slack_images:
+                        print(
+                            f"[yellow]Adjuntos visuales a Trello activos en modo "
+                            f"{self.config.trello_image_attachment_mode}; imágenes grandes pueden fallar "
+                            f"si superan SLACK_IMAGE_MAX_BYTES={self.config.slack_image_max_bytes}.[/yellow]"
+                        )
                 except Exception as exc:
                     ok = False
                     print(f"[red]Trello falló:[/red] {exc}")

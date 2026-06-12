@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import requests
@@ -200,6 +201,38 @@ class TrelloClient:
                 )
             )
         return comments
+
+    def attach_file_to_card(self, card_id: str, file_path: Path, name: Optional[str] = None) -> str:
+        query = {
+            "key": self.api_key,
+            "token": self.token,
+        }
+        if name:
+            query["name"] = name
+
+        with file_path.open("rb") as handle:
+            response = requests.post(
+                f"{TRELLO_API_BASE}/cards/{card_id}/attachments",
+                params=query,
+                files={"file": (name or file_path.name, handle)},
+                timeout=self.timeout,
+                headers={"Accept": "application/json"},
+            )
+        if response.status_code >= 400:
+            raise TrelloError(f"Trello devolvió {response.status_code}: {response.text[:500]}")
+        payload = response.json()
+        return str(payload.get("id") or "")
+
+    def add_url_attachment_to_card(self, card_id: str, url: str, name: Optional[str] = None) -> str:
+        body: dict[str, Any] = {"url": url}
+        if name:
+            body["name"] = name
+        payload = self._request(
+            "POST",
+            f"/cards/{card_id}/attachments",
+            json_body=body,
+        )
+        return str(payload.get("id") or "")
 
 
 def build_trello_token_url(api_key: str) -> str:

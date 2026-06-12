@@ -98,6 +98,8 @@ export SYNC_TELEGRAM_POLL_ENABLED={shell_quote(bool_env(sync_telegram_poll_enabl
 export FINAL_REPLY_MODE={shell_quote(final_reply_mode)}
 
 while true; do
+  {shell_quote(python_path)} {shell_quote(str(main_path))} trello-reply-sync --limit 50 || echo "trello-reply-sync failed with $?"
+
   if [[ "$SYNC_WAITING_ENABLED" == "true" ]]; then
     {shell_quote(python_path)} {shell_quote(str(main_path))} trello-waiting-sync --limit 50 || echo "trello-waiting-sync failed with $?"
   fi

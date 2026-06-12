@@ -23,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
             "trello-auth-url",
             "trello-lists",
             "trello-sync",
+            "trello-reply-sync",
             "trello-waiting-sync",
             "trello-done-sync",
             "telegram-poll",
@@ -116,6 +117,10 @@ def main() -> int:
     if args.command == "trello-sync":
         synced = app.sync_pending_trello_tasks(limit=args.limit if args.limit is not None else 20)
         print(f"[green]Cards creadas en Trello:[/green] {synced}")
+        return 0
+    if args.command == "trello-reply-sync":
+        sent = app.sync_trello_reply_commands(limit=args.limit if args.limit is not None else 50)
+        print(f"[green]Respuestas enviadas a Slack desde Trello:[/green] {sent}")
         return 0
     if args.command == "trello-waiting-sync":
         requested = app.sync_trello_waiting_requests(limit=args.limit if args.limit is not None else 50)
