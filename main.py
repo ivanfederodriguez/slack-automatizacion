@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 from dotenv import load_dotenv
 from rich import print
@@ -24,6 +25,8 @@ def build_parser() -> argparse.ArgumentParser:
             "trello-sync",
             "trello-done-sync",
             "telegram-poll",
+            "transcribe-audio",
+            "transcribe-audio-folder",
             "install-autostart",
             "uninstall-autostart",
         ],
@@ -32,8 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "task_id",
         nargs="?",
-        type=int,
-        help="ID de tarea para comandos puntuales como `approve-reply`.",
+        help="ID de tarea para comandos puntuales o PATH para comandos de transcripción.",
     )
     parser.add_argument(
         "--limit",
@@ -94,10 +96,11 @@ def main() -> int:
     if args.command == "approve-reply":
         if args.task_id is None:
             parser.error("approve-reply requiere el ID de la tarea.")
-        ok = app.approve_reply(args.task_id, args.reply, send=args.send)
+        task_id = int(args.task_id)
+        ok = app.approve_reply(task_id, args.reply, send=args.send)
         if ok:
             action = "aprobada y enviada" if args.send else "aprobada"
-            print(f"[green]Respuesta {action} para tarea #{args.task_id}.[/green]")
+            print(f"[green]Respuesta {action} para tarea #{task_id}.[/green]")
             return 0
         return 1
     if args.command == "tasks":
@@ -120,6 +123,18 @@ def main() -> int:
     if args.command == "telegram-poll":
         handled = app.poll_telegram_updates(limit=args.limit if args.limit is not None else 20)
         print(f"[green]Comandos Telegram procesados:[/green] {handled}")
+        return 0
+    if args.command == "transcribe-audio":
+        if args.task_id is None:
+            parser.error("transcribe-audio requiere un PATH.")
+        print(app.transcribe_audio_path(Path(args.task_id)))
+        return 0
+    if args.command == "transcribe-audio-folder":
+        if args.task_id is None:
+            parser.error("transcribe-audio-folder requiere un PATH.")
+        for path, transcript in app.transcribe_audio_folder(Path(args.task_id)):
+            print(f"\n[bold]{path.name}[/bold]")
+            print(transcript)
         return 0
     if args.command == "install-autostart":
         app.install_autostart()

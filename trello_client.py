@@ -28,6 +28,9 @@ class TrelloCardState:
     list_id: str
     list_name: str
     closed: bool
+    due_complete: bool = False
+    checklist_done: bool = False
+    checklist_items: tuple[dict[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -125,12 +128,23 @@ class TrelloClient:
             "GET",
             f"/cards/{card_id}",
             params={
-                "fields": "name,url,idList,closed",
+                "fields": "name,url,idList,closed,dueComplete",
                 "list": "true",
                 "list_fields": "name",
+                "checklists": "all",
+                "checkItem_fields": "name,state",
             },
         )
         card_list = payload.get("list") or {}
+        checklist_items = []
+        for checklist in payload.get("checklists") or []:
+            for item in checklist.get("checkItems") or []:
+                checklist_items.append(
+                    {
+                        "name": str(item.get("name") or ""),
+                        "state": str(item.get("state") or ""),
+                    }
+                )
         return TrelloCardState(
             id=payload["id"],
             name=payload.get("name") or "",
@@ -138,6 +152,8 @@ class TrelloClient:
             list_id=payload.get("idList") or "",
             list_name=card_list.get("name") or "",
             closed=bool(payload.get("closed")),
+            due_complete=bool(payload.get("dueComplete")),
+            checklist_items=tuple(checklist_items),
         )
 
     def add_card_comment(self, card_id: str, text: str) -> None:

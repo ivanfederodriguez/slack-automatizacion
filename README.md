@@ -95,6 +95,8 @@ TRELLO_LIST_ID=
 TRELLO_MEMBER_IDS=
 TRELLO_LABEL_IDS=
 TRELLO_CARD_POSITION=top
+TRELLO_DONE_MODE=check
+TRELLO_DONE_CHECKLIST_ITEM_NAME=Hecho
 TRELLO_DONE_LIST_ID=
 TRELLO_DONE_LIST_NAMES=Hecho,Done
 
@@ -102,6 +104,20 @@ TRELLO_DONE_LIST_NAMES=Hecho,Done
 TELEGRAM_ENABLED=false
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
+
+# Audio opcional
+AUDIO_TRANSCRIPTION_ENABLED=true
+SLACK_AUDIO_TRANSCRIPTS_ENABLED=true
+LOCAL_WHISPER_ENABLED=true
+LOCAL_WHISPER_MODEL=tiny
+LOCAL_WHISPER_LANGUAGE=es
+LOCAL_WHISPER_DEVICE=auto
+LOCAL_WHISPER_COMPUTE_TYPE=auto
+LOCAL_WHISPER_MAX_SECONDS=600
+LOCAL_WHISPER_KEEP_AUDIO_FILES=false
+LOCAL_WHISPER_CACHE_DIR=~/Library/Application Support/slack-personal-agent/audio
+AUDIO_TRANSCRIPT_FUSION_ENABLED=true
+AUDIO_TRANSCRIPT_FUSION_MODEL=main
 
 DB_PATH=slack_agent.db
 ```
@@ -130,7 +146,9 @@ Si llega contexto nuevo en el mismo thread, actualiza la tarea existente, agrega
 Buenisimo, gracias. Lo sumo al pedido. El registro queda como: '{summary_actualizado}'.
 ```
 
-Cuando una card pasa a una lista configurada como hecha (`TRELLO_DONE_LIST_ID` o nombre en `TRELLO_DONE_LIST_NAMES`), la tarea cambia a `done_pending_reply`. El agente no contesta Slack: prepara un cierre seguro y manda Telegram a Ivan con:
+Cuando una card queda marcada como hecha segun `TRELLO_DONE_MODE`, la tarea cambia a `done_pending_reply`. El modo recomendado es `check`, que usa el check nativo de Trello (`dueComplete`). Tambien siguen disponibles `list`, `checklist` y `list_or_check` para compatibilidad.
+
+El agente no contesta Slack al detectar una card hecha: prepara un cierre seguro y manda Telegram a Ivan con:
 
 ```text
 /send TASK_ID
@@ -168,6 +186,21 @@ Chequea cards ya creadas en Trello y, si alguna paso a una lista marcada como he
 Lee comandos pendientes del bot de Telegram y procesa `/send`, `/edit` y `/nosend`. Es util para probar aprobaciones manualmente o para destrabar mensajes si queres correr Telegram por separado.
 
 Las respuestas finales no se envian automaticamente. El agente solo manda el mensaje final a Slack cuando Ivan usa `/send TASK_ID` o cuando se dispara un envio manual explicito por el flujo seguro existente.
+
+## Audio
+
+Antes de clasificar un mensaje, el agente puede convertir audios de Slack en texto. Primero usa la transcripcion que ya venga en Slack si existe; si `LOCAL_WHISPER_ENABLED=true`, descarga el archivo privado con el token de Slack y lo transcribe con Whisper local bajo demanda. Si ambas versiones existen, las fusiona con el modelo principal usando un prompt conservador que no inventa contenido.
+
+Si solo hay una transcripcion disponible, usa esa. Si no hay ninguna o falla la descarga/transcripcion, lo deja auditado en SQLite y no rompe el procesamiento. El agente no descarga audios cuando `LOCAL_WHISPER_ENABLED=false`, y no conserva archivos salvo que `LOCAL_WHISPER_KEEP_AUDIO_FILES=true`.
+
+Scopes utiles para audio en Slack: el token debe poder leer archivos privados, normalmente con `files:read` ademas de los scopes de conversaciones que ya usa el agente.
+
+Para probar Whisper local sin depender de Slack:
+
+```bash
+python main.py transcribe-audio /ruta/audio.m4a
+python main.py transcribe-audio-folder /ruta/carpeta
+```
 
 ## Primer arranque
 
@@ -263,6 +296,8 @@ python main.py trello-lists
 python main.py trello-sync --limit 20
 python main.py trello-done-sync --limit 50
 python main.py telegram-poll --limit 20
+python main.py transcribe-audio /ruta/audio.m4a
+python main.py transcribe-audio-folder /ruta/carpeta
 python main.py install-autostart
 python main.py uninstall-autostart
 ```
@@ -285,6 +320,8 @@ La base ya guarda informacion para auditar el flujo de respuesta:
 - `done_pending_reply_at`
 - `final_reply_suggestion`
 - `telegram_error`
+
+La tabla `audio_transcriptions` guarda la auditoria de audios: transcript de Slack, transcript local, transcript fusionado, texto seleccionado, estado y error si aplica.
 
 Estados utiles:
 
@@ -311,6 +348,7 @@ La suite actual cubre, entre otras cosas:
 - sync a Trello;
 - acuse automatico y actualizacion de contexto;
 - deteccion de cards hechas y aprobacion Telegram;
+- transcripcion de audio Slack/local y fusion conservadora;
 - review interactivo;
 - aprobacion de respuestas;
 - envio exitoso y fallo de envio a Slack.

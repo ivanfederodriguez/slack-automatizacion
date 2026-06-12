@@ -2,10 +2,12 @@ import sqlite3
 from datetime import datetime, timezone
 
 from main import build_parser
-from trello_client import TrelloCard, TrelloCardState
+import trello_client
+from trello_client import TrelloCard, TrelloCardState, TrelloClient
 from slack_personal_agent import (
     AgentApp,
     AgentConfig,
+    AudioTranscriptFusion,
     SlackClassification,
     local_model_fit_hint,
     parse_snooze_until,
@@ -168,6 +170,21 @@ class FakeTelegramClient:
         return list(self.updates[:limit])
 
 
+class FakeAudioTranscriber:
+    def __init__(self, responses=None, error=None):
+        self.responses = list(responses or [])
+        self.error = error
+        self.calls = []
+
+    def transcribe(self, audio_path):
+        self.calls.append(audio_path)
+        if self.error is not None:
+            raise self.error
+        if self.responses:
+            return self.responses.pop(0)
+        return "Transcripción local de prueba."
+
+
 def get_processed_row(db_path):
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -185,6 +202,23 @@ def get_task(db_path, where="1 = 1", params=()):
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute(f"SELECT * FROM tasks WHERE {where} ORDER BY id ASC LIMIT 1", params).fetchone()
+
+
+def get_audio_rows(db_path):
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT * FROM audio_transcriptions ORDER BY id ASC").fetchall()
+
+
+def audio_file(**overrides):
+    payload = {
+        "id": "F1",
+        "name": "audio.m4a",
+        "mimetype": "audio/mp4",
+        "url_private_download": "https://files.slack.test/audio.m4a",
+    }
+    payload.update(overrides)
+    return payload
 
 
 def insert_task(
@@ -465,6 +499,268 @@ def test_duplicate_thread_context_does_not_send_confirmation(tmp_path):
     assert len(fake_slack.post_calls) == 1
 
 
+def test_audio_disabled_does_not_change_flow(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    app = AgentApp(
+        make_config(tmp_path, AUDIO_TRANSCRIPTION_ENABLED="false"),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        audio_transcriber=FakeAudioTranscriber(error=AssertionError("should not transcribe")),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {
+            "ts": "1.9",
+            "text": "Revisás este reporte?",
+            "user": "UOTHER",
+            "files": [audio_file(transcription_text="audio ignorado")],
+        },
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    assert "Audios transcriptos" not in fake_model.calls[0]
+    assert get_audio_rows(app.config.db_path) == []
+
+
+def test_slack_audio_transcript_only_is_used_before_classification(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    app = AgentApp(
+        make_config(tmp_path, LOCAL_WHISPER_ENABLED="false"),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {
+            "ts": "2.1",
+            "text": "",
+            "user": "UOTHER",
+            "files": [audio_file(transcription_text="Necesito revisar el reporte de audio.")],
+        },
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    assert "Audios transcriptos:" in fake_model.calls[0]
+    assert "Necesito revisar el reporte de audio." in fake_model.calls[0]
+    rows = get_audio_rows(app.config.db_path)
+    assert rows[0]["transcription_status"] == "slack_only"
+    assert rows[0]["selected_transcript_text"] == "Necesito revisar el reporte de audio."
+
+
+def test_local_whisper_audio_transcript_only_is_used_before_classification(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_transcriber = FakeAudioTranscriber(["Necesito revisar el reporte local."])
+    app = AgentApp(
+        make_config(tmp_path, SLACK_AUDIO_TRANSCRIPTS_ENABLED="false"),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        audio_transcriber=fake_transcriber,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    app.download_audio_attachment = lambda attachment: tmp_path / "audio.m4a"
+
+    app.process_message(
+        {"ts": "2.2", "text": "", "user": "UOTHER", "files": [audio_file()]},
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    assert fake_transcriber.calls == [tmp_path / "audio.m4a"]
+    assert "Necesito revisar el reporte local." in fake_model.calls[0]
+    assert get_audio_rows(app.config.db_path)[0]["transcription_status"] == "local_only"
+
+
+def test_slack_and_local_audio_transcripts_are_fused(tmp_path):
+    fake_model = FakeStructuredModel([
+        AudioTranscriptFusion(transcript="Necesito revisar el reporte fusionado."),
+        sample_classification(),
+    ])
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        audio_transcriber=FakeAudioTranscriber(["Necesito revisar reporte local."]),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    app.download_audio_attachment = lambda attachment: tmp_path / "audio.m4a"
+
+    app.process_message(
+        {
+            "ts": "2.3",
+            "text": "",
+            "user": "UOTHER",
+            "files": [audio_file(transcription_text="Necesito revisar el reporte Slack.")],
+        },
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    assert "Transcripción de Slack" in fake_model.calls[0]
+    assert "Necesito revisar el reporte fusionado." in fake_model.calls[1]
+    row = get_audio_rows(app.config.db_path)[0]
+    assert row["transcription_status"] == "fused"
+    assert row["fused_transcript_text"] == "Necesito revisar el reporte fusionado."
+
+
+def test_audio_fusion_failure_falls_back_to_local(tmp_path):
+    fake_model = FakeStructuredModel([RuntimeError("fusion down"), sample_classification()])
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        audio_transcriber=FakeAudioTranscriber(["Texto local más confiable."]),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    app.download_audio_attachment = lambda attachment: tmp_path / "audio.m4a"
+
+    app.process_message(
+        {
+            "ts": "2.4",
+            "text": "",
+            "user": "UOTHER",
+            "files": [audio_file(transcription_text="Texto Slack.")],
+        },
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    assert "Texto local más confiable." in fake_model.calls[1]
+    row = get_audio_rows(app.config.db_path)[0]
+    assert row["transcription_status"] == "local_only"
+    assert row["selected_transcript_text"] == "Texto local más confiable."
+    assert row["transcription_error"] == "fusion down"
+
+
+def test_multiple_audio_transcripts_are_concatenated_in_order(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    app = AgentApp(
+        make_config(tmp_path, LOCAL_WHISPER_ENABLED="false"),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {
+            "ts": "2.5",
+            "text": "",
+            "user": "UOTHER",
+            "files": [
+                audio_file(id="F1", name="uno.m4a", transcription_text="Primer audio."),
+                audio_file(id="F2", name="dos.m4a", transcription_text="Segundo audio."),
+            ],
+        },
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    prompt = fake_model.calls[0]
+    assert "[Audio 1]: Primer audio." in prompt
+    assert "[Audio 2]: Segundo audio." in prompt
+    assert prompt.index("[Audio 1]") < prompt.index("[Audio 2]")
+
+
+def test_text_and_audio_are_combined_before_classification(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    app = AgentApp(
+        make_config(tmp_path, LOCAL_WHISPER_ENABLED="false"),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {
+            "ts": "2.6",
+            "text": "Este es el contexto escrito.",
+            "user": "UOTHER",
+            "files": [audio_file(transcription_text="Este es el contexto hablado.")],
+        },
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    prompt = fake_model.calls[0]
+    assert "Texto original:" in prompt
+    assert "Este es el contexto escrito." in prompt
+    assert "Audios transcriptos:" in prompt
+    assert "Este es el contexto hablado." in prompt
+
+
+def test_audio_in_existing_thread_adds_context_without_duplicate(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(tmp_path, LOCAL_WHISPER_ENABLED="false"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    conversation = {"id": "D123", "is_im": True, "user": "UOTHER"}
+
+    app.process_message(
+        {"ts": "2.7", "text": "Revisás este reporte?", "user": "UOTHER"},
+        conversation,
+        my_user_id="UME",
+    )
+    app.process_message(
+        {
+            "ts": "2.8",
+            "thread_ts": "2.7",
+            "text": "",
+            "user": "UOTHER",
+            "files": [audio_file(transcription_text="Sumo el audio con el detalle.")],
+        },
+        conversation,
+        my_user_id="UME",
+    )
+
+    assert count_tasks(app.config.db_path) == 1
+    assert len(fake_model.calls) == 1
+    assert "transcribí el audio" in fake_slack.post_calls[1]["text"]
+    audio_row = get_audio_rows(app.config.db_path)[0]
+    assert audio_row["task_id"] == 1
+    assert audio_row["selected_transcript_text"] == "Sumo el audio con el detalle."
+
+
+def test_audio_download_failure_is_audited_and_does_not_break(tmp_path):
+    fake_model = FakeStructuredModel([])
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        audio_transcriber=FakeAudioTranscriber(),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    app.download_audio_attachment = lambda attachment: (_ for _ in ()).throw(RuntimeError("download failed"))
+
+    app.process_message(
+        {"ts": "2.9", "text": "", "user": "UOTHER", "files": [audio_file()]},
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    row = get_audio_rows(app.config.db_path)[0]
+    processed = get_processed_row(app.config.db_path)
+    assert row["transcription_status"] == "failed"
+    assert row["transcription_error"] == "download failed"
+    assert processed["classification_status"] == "ignored"
+    assert count_tasks(app.config.db_path) == 0
+
+
 def test_channel_without_mention_is_ignored(tmp_path):
     fake_model = FakeStructuredModel([])
     app = AgentApp(
@@ -650,6 +946,7 @@ def test_trello_done_marks_done_pending_reply_and_sends_telegram(tmp_path):
         make_config(
             tmp_path,
             TRELLO_ENABLED="true",
+            TRELLO_DONE_MODE="list",
             TRELLO_API_KEY="key",
             TRELLO_TOKEN="token",
             TELEGRAM_ENABLED="true",
@@ -693,6 +990,289 @@ def test_trello_done_marks_done_pending_reply_and_sends_telegram(tmp_path):
     assert "/nosend 1" in fake_telegram.sent_messages[0]
 
 
+def test_trello_done_mode_check_accepts_due_complete(tmp_path):
+    fake_slack = FakeSlackClient()
+    fake_trello = FakeTrelloClient(
+        card_state=TrelloCardState(
+            id="card123",
+            name="Reporte",
+            url="https://trello.com/c/card123",
+            list_id="list123",
+            list_name="Inbox",
+            closed=False,
+            due_complete=True,
+        )
+    )
+    app = AgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_DONE_MODE="check"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="50.2",
+        summary="Validar reporte mensual",
+        requested_action="Comparar el reporte",
+        priority="medium",
+        category="data",
+        classification=make_classification(summary="Validar reporte mensual"),
+        trello_card_id="card123",
+    )
+
+    assert app.sync_trello_done_tasks() == 1
+
+    task = get_task(app.config.db_path)
+    assert task["status"] == "done_pending_reply"
+    assert fake_slack.post_calls == []
+
+
+def test_trello_done_mode_check_ignores_incomplete_due(tmp_path):
+    fake_trello = FakeTrelloClient(
+        card_state=TrelloCardState(
+            id="card123",
+            name="Reporte",
+            url="https://trello.com/c/card123",
+            list_id="done123",
+            list_name="Hecho",
+            closed=False,
+            due_complete=False,
+        )
+    )
+    app = AgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_DONE_MODE="check"),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="50.3",
+        summary="Validar reporte mensual",
+        requested_action="Comparar el reporte",
+        priority="medium",
+        category="data",
+        classification=make_classification(summary="Validar reporte mensual"),
+        trello_card_id="card123",
+    )
+
+    assert app.sync_trello_done_tasks() == 0
+    assert get_task(app.config.db_path)["status"] == "new"
+
+
+def test_trello_done_mode_list_keeps_existing_behavior(tmp_path):
+    fake_trello = FakeTrelloClient(
+        card_state=TrelloCardState(
+            id="card123",
+            name="Reporte",
+            url="https://trello.com/c/card123",
+            list_id="done123",
+            list_name="Hecho",
+            closed=False,
+            due_complete=False,
+        )
+    )
+    app = AgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_DONE_MODE="list"),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="50.4",
+        summary="Validar reporte mensual",
+        requested_action="Comparar el reporte",
+        priority="medium",
+        category="data",
+        classification=make_classification(summary="Validar reporte mensual"),
+        trello_card_id="card123",
+    )
+
+    assert app.sync_trello_done_tasks() == 1
+    assert get_task(app.config.db_path)["status"] == "done_pending_reply"
+
+
+def test_trello_done_mode_list_or_check_accepts_list_or_check(tmp_path):
+    for message_ts, card_state in [
+        (
+            "50.5",
+            TrelloCardState(
+                id="card123",
+                name="Reporte",
+                url="https://trello.com/c/card123",
+                list_id="list123",
+                list_name="Inbox",
+                closed=False,
+                due_complete=True,
+            ),
+        ),
+        (
+            "50.6",
+            TrelloCardState(
+                id="card123",
+                name="Reporte",
+                url="https://trello.com/c/card123",
+                list_id="done123",
+                list_name="Hecho",
+                closed=False,
+                due_complete=False,
+            ),
+        ),
+    ]:
+        case_tmp_path = tmp_path / message_ts
+        case_tmp_path.mkdir()
+        fake_trello = FakeTrelloClient(card_state=card_state)
+        app = AgentApp(
+            make_config(case_tmp_path, TRELLO_ENABLED="true", TRELLO_DONE_MODE="list_or_check"),
+            slack_client=FakeSlackClient(),
+            structured_model_factory=lambda schema: FakeStructuredModel([]),
+            trello_client=fake_trello,
+            sleep_fn=lambda _: None,
+        )
+        app.init_db()
+        insert_task(
+            app,
+            created_at="2026-06-11T12:00:00+00:00",
+            message_ts=message_ts,
+            summary="Validar reporte mensual",
+            requested_action="Comparar el reporte",
+            priority="medium",
+            category="data",
+            classification=make_classification(summary="Validar reporte mensual"),
+            trello_card_id="card123",
+        )
+
+        assert app.sync_trello_done_tasks() == 1
+        assert get_task(app.config.db_path)["status"] == "done_pending_reply"
+
+
+def test_trello_done_mode_checklist_uses_configured_item(tmp_path):
+    fake_trello = FakeTrelloClient(
+        card_state=TrelloCardState(
+            id="card123",
+            name="Reporte",
+            url="https://trello.com/c/card123",
+            list_id="list123",
+            list_name="Inbox",
+            closed=False,
+            checklist_items=(
+                {"name": "Hecho", "state": "complete"},
+                {"name": "Avisar", "state": "incomplete"},
+            ),
+        )
+    )
+    app = AgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_DONE_MODE="checklist"),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="50.7",
+        summary="Validar reporte mensual",
+        requested_action="Comparar el reporte",
+        priority="medium",
+        category="data",
+        classification=make_classification(summary="Validar reporte mensual"),
+        trello_card_id="card123",
+    )
+
+    assert app.sync_trello_done_tasks() == 1
+    assert get_task(app.config.db_path)["status"] == "done_pending_reply"
+
+
+def test_trello_done_mode_checklist_ignores_incomplete_item(tmp_path):
+    fake_trello = FakeTrelloClient(
+        card_state=TrelloCardState(
+            id="card123",
+            name="Reporte",
+            url="https://trello.com/c/card123",
+            list_id="list123",
+            list_name="Inbox",
+            closed=False,
+            checklist_items=({"name": "Hecho", "state": "incomplete"},),
+        )
+    )
+    app = AgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_DONE_MODE="checklist"),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="50.8",
+        summary="Validar reporte mensual",
+        requested_action="Comparar el reporte",
+        priority="medium",
+        category="data",
+        classification=make_classification(summary="Validar reporte mensual"),
+        trello_card_id="card123",
+    )
+
+    assert app.sync_trello_done_tasks() == 0
+    assert get_task(app.config.db_path)["status"] == "new"
+
+
+def test_trello_client_get_card_reads_due_complete_and_checklists(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "id": "card123",
+                "name": "Reporte",
+                "url": "https://trello.com/c/card123",
+                "idList": "list123",
+                "closed": False,
+                "dueComplete": True,
+                "list": {"name": "Inbox"},
+                "checklists": [
+                    {
+                        "checkItems": [
+                            {"name": "Hecho", "state": "complete"},
+                            {"name": "Avisar", "state": "incomplete"},
+                        ]
+                    }
+                ],
+            }
+
+    def fake_request(method, url, **kwargs):
+        captured["params"] = kwargs["params"]
+        return FakeResponse()
+
+    monkeypatch.setattr(trello_client.requests, "request", fake_request)
+
+    card = TrelloClient("key", "token").get_card("card123")
+
+    assert captured["params"]["fields"] == "name,url,idList,closed,dueComplete"
+    assert captured["params"]["checklists"] == "all"
+    assert card.due_complete is True
+    assert card.checklist_items == (
+        {"name": "Hecho", "state": "complete"},
+        {"name": "Avisar", "state": "incomplete"},
+    )
+
+
 def test_trello_done_channel_final_reply_uses_mention(tmp_path):
     fake_trello = FakeTrelloClient(
         card_state=TrelloCardState(
@@ -708,6 +1288,7 @@ def test_trello_done_channel_final_reply_uses_mention(tmp_path):
         make_config(
             tmp_path,
             TRELLO_ENABLED="true",
+            TRELLO_DONE_MODE="list",
             TRELLO_API_KEY="key",
             TRELLO_TOKEN="token",
             TELEGRAM_ENABLED="true",
@@ -861,6 +1442,7 @@ def test_telegram_failure_is_saved_without_breaking_done_sync(tmp_path):
         make_config(
             tmp_path,
             TRELLO_ENABLED="true",
+            TRELLO_DONE_MODE="list",
             TRELLO_API_KEY="key",
             TRELLO_TOKEN="token",
             TELEGRAM_ENABLED="true",
@@ -1051,7 +1633,7 @@ def test_main_parser_accepts_review_command():
 def test_main_parser_accepts_approve_reply_command():
     args = build_parser().parse_args(["approve-reply", "12", "--send"])
     assert args.command == "approve-reply"
-    assert args.task_id == 12
+    assert args.task_id == "12"
     assert args.send
 
 
@@ -1059,6 +1641,27 @@ def test_main_parser_accepts_review_send_mode():
     args = build_parser().parse_args(["review", "--send-approved-replies"])
     assert args.command == "review"
     assert args.send_approved_replies
+
+
+def test_main_parser_accepts_transcribe_audio_command():
+    args = build_parser().parse_args(["transcribe-audio", "/tmp/audio.m4a"])
+    assert args.command == "transcribe-audio"
+    assert args.task_id == "/tmp/audio.m4a"
+
+
+def test_transcribe_audio_path_uses_injected_transcriber(tmp_path):
+    fake_transcriber = FakeAudioTranscriber(["Texto transcripto local."])
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        audio_transcriber=fake_transcriber,
+        sleep_fn=lambda _: None,
+    )
+    audio_path = tmp_path / "audio.m4a"
+
+    assert app.transcribe_audio_path(audio_path) == "Texto transcripto local."
+    assert fake_transcriber.calls == [audio_path]
 
 
 def test_parse_snooze_until_accepts_relative_values():

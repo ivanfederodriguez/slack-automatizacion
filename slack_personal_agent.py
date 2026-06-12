@@ -22,6 +22,16 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from autostart import install_launch_agents, uninstall_launch_agents
+from audio_transcription import (
+    AudioAttachment,
+    AudioTranscriber,
+    AudioTranscriptResult,
+    LocalWhisperTranscriber,
+    choose_audio_transcript,
+    combine_text_and_audio,
+    detect_audio_attachments,
+    format_audio_transcripts_for_message,
+)
 from trello_client import TrelloCard, TrelloCardState, TrelloClient, TrelloError, build_trello_token_url
 from url_enrichment import (
     MessageLink,
@@ -126,6 +136,10 @@ class SlackClassification(BaseModel):
 class DoctorCheck(BaseModel):
     status: Literal["ok"]
     summary: str
+
+
+class AudioTranscriptFusion(BaseModel):
+    transcript: str
 
 
 class AgentState(TypedDict, total=False):
@@ -270,11 +284,25 @@ class AgentConfig:
     trello_member_ids: tuple[str, ...] = ()
     trello_label_ids: tuple[str, ...] = ()
     trello_card_position: str = "top"
+    trello_done_mode: Literal["check", "list", "checklist", "list_or_check"] = "check"
+    trello_done_checklist_item_name: str = "Hecho"
     trello_done_list_id: str = ""
     trello_done_list_names: tuple[str, ...] = ("hecho", "done")
     telegram_enabled: bool = False
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    audio_transcription_enabled: bool = True
+    slack_audio_transcripts_enabled: bool = True
+    local_whisper_enabled: bool = True
+    local_whisper_model: str = "tiny"
+    local_whisper_language: str = "es"
+    local_whisper_device: str = "auto"
+    local_whisper_compute_type: str = "auto"
+    local_whisper_max_seconds: int = 600
+    local_whisper_keep_audio_files: bool = False
+    local_whisper_cache_dir: str = "~/Library/Application Support/slack-personal-agent/audio"
+    audio_transcript_fusion_enabled: bool = True
+    audio_transcript_fusion_model: str = "main"
     db_path: str = DB_PATH
 
     @classmethod
@@ -290,6 +318,10 @@ class AgentConfig:
         if model_provider not in {"ollama", "groq"}:
             raise ConfigError("MODEL_PROVIDER debe ser 'ollama' o 'groq'.")
 
+        trello_done_mode = (get("TRELLO_DONE_MODE", "check") or "check").strip().lower()
+        if trello_done_mode not in {"check", "list", "checklist", "list_or_check"}:
+            raise ConfigError("TRELLO_DONE_MODE debe ser check, list, checklist o list_or_check.")
+
         poll_seconds_raw = (get("POLL_SECONDS", "300") or "300").strip()
         sleep_seconds_raw = (get("SLACK_SLEEP_SECONDS", "1.2") or "1.2").strip()
 
@@ -302,6 +334,12 @@ class AgentConfig:
             slack_sleep_seconds = float(sleep_seconds_raw)
         except ValueError as exc:
             raise ConfigError("SLACK_SLEEP_SECONDS debe ser un número.") from exc
+
+        max_audio_seconds_raw = (get("LOCAL_WHISPER_MAX_SECONDS", "600") or "600").strip()
+        try:
+            local_whisper_max_seconds = int(max_audio_seconds_raw)
+        except ValueError as exc:
+            raise ConfigError("LOCAL_WHISPER_MAX_SECONDS debe ser un entero.") from exc
 
         mention_aliases = tuple(
             alias
@@ -351,11 +389,33 @@ class AgentConfig:
             trello_member_ids=trello_member_ids,
             trello_label_ids=trello_label_ids,
             trello_card_position=(get("TRELLO_CARD_POSITION", "top") or "top").strip(),
+            trello_done_mode=trello_done_mode,  # type: ignore[arg-type]
+            trello_done_checklist_item_name=(
+                get("TRELLO_DONE_CHECKLIST_ITEM_NAME", "Hecho") or "Hecho"
+            ).strip(),
             trello_done_list_id=(get("TRELLO_DONE_LIST_ID", "") or "").strip(),
             trello_done_list_names=trello_done_list_names or ("hecho", "done"),
             telegram_enabled=parse_bool(get("TELEGRAM_ENABLED", "false") or "false"),
             telegram_bot_token=(get("TELEGRAM_BOT_TOKEN", "") or "").strip(),
             telegram_chat_id=(get("TELEGRAM_CHAT_ID", "") or "").strip(),
+            audio_transcription_enabled=parse_bool(get("AUDIO_TRANSCRIPTION_ENABLED", "true") or "true"),
+            slack_audio_transcripts_enabled=parse_bool(get("SLACK_AUDIO_TRANSCRIPTS_ENABLED", "true") or "true"),
+            local_whisper_enabled=parse_bool(get("LOCAL_WHISPER_ENABLED", "true") or "true"),
+            local_whisper_model=(get("LOCAL_WHISPER_MODEL", "tiny") or "tiny").strip(),
+            local_whisper_language=(get("LOCAL_WHISPER_LANGUAGE", "es") or "es").strip(),
+            local_whisper_device=(get("LOCAL_WHISPER_DEVICE", "auto") or "auto").strip(),
+            local_whisper_compute_type=(get("LOCAL_WHISPER_COMPUTE_TYPE", "auto") or "auto").strip(),
+            local_whisper_max_seconds=local_whisper_max_seconds,
+            local_whisper_keep_audio_files=parse_bool(get("LOCAL_WHISPER_KEEP_AUDIO_FILES", "false") or "false"),
+            local_whisper_cache_dir=(
+                get(
+                    "LOCAL_WHISPER_CACHE_DIR",
+                    "~/Library/Application Support/slack-personal-agent/audio",
+                )
+                or "~/Library/Application Support/slack-personal-agent/audio"
+            ).strip(),
+            audio_transcript_fusion_enabled=parse_bool(get("AUDIO_TRANSCRIPT_FUSION_ENABLED", "true") or "true"),
+            audio_transcript_fusion_model=(get("AUDIO_TRANSCRIPT_FUSION_MODEL", "main") or "main").strip(),
             db_path=(get("DB_PATH", DB_PATH) or DB_PATH).strip(),
         )
 
@@ -422,6 +482,7 @@ class AgentApp:
         structured_model_factory: Optional[Callable[[type[BaseModel]], StructuredModel]] = None,
         trello_client: Optional[TrelloClientProtocol] = None,
         telegram_client: Optional[TelegramClientProtocol] = None,
+        audio_transcriber: Optional[AudioTranscriber] = None,
         public_preview_fetcher: Optional[PublicPreviewFetcher] = None,
         input_fn: Callable[[str], str] = input,
         open_url_fn: Callable[[str], bool] = webbrowser.open,
@@ -432,10 +493,12 @@ class AgentApp:
         self._structured_model_factory = structured_model_factory or self._build_structured_model
         self._trello_client = trello_client
         self._telegram_client = telegram_client
+        self._audio_transcriber = audio_transcriber
         self._public_preview_fetcher = public_preview_fetcher or self.fetch_public_url_preview
         self._input = input_fn
         self._open_url = open_url_fn
         self._classifier: Optional[StructuredModel] = None
+        self._audio_fusion_model: Optional[StructuredModel] = None
         self._graph = None
         self._user_cache: dict[str, str] = {}
         self._sleep = sleep_fn
@@ -519,6 +582,29 @@ class AgentApp:
                     fetched_at TEXT NOT NULL,
                     metadata_json TEXT,
                     UNIQUE(channel_id, message_ts, url)
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audio_transcriptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    source_message_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    message_ts TEXT NOT NULL,
+                    task_id INTEGER,
+                    file_id TEXT,
+                    filename TEXT,
+                    mime_type TEXT,
+                    slack_transcript_text TEXT,
+                    local_transcript_text TEXT,
+                    fused_transcript_text TEXT,
+                    selected_transcript_text TEXT,
+                    transcription_status TEXT NOT NULL,
+                    transcription_error TEXT,
+                    created_at TEXT NOT NULL
                 )
                 """
             )
@@ -636,6 +722,12 @@ class AgentApp:
             )
             conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_audio_transcriptions_message
+                ON audio_transcriptions(channel_id, message_ts)
+                """
+            )
+            conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_task_events_task
                 ON task_events(task_id, created_at)
                 """
@@ -730,6 +822,51 @@ class AgentApp:
             self._classifier = self._structured_model_factory(SlackClassification)
         return self._classifier
 
+    def get_audio_fusion_model(self) -> StructuredModel:
+        if self._audio_fusion_model is None:
+            self._audio_fusion_model = self._structured_model_factory(AudioTranscriptFusion)
+        return self._audio_fusion_model
+
+    def get_audio_transcriber(self) -> AudioTranscriber:
+        if self._audio_transcriber is None:
+            self._audio_transcriber = LocalWhisperTranscriber(
+                model_name=self.config.local_whisper_model,
+                language=self.config.local_whisper_language,
+                device=self.config.local_whisper_device,
+                compute_type=self.config.local_whisper_compute_type,
+            )
+        return self._audio_transcriber
+
+    def build_audio_fusion_prompt(self, slack_text: str, local_text: str) -> str:
+        return f"""
+Tenés dos transcripciones del mismo audio de trabajo.
+
+Transcripción de Slack:
+{slack_text}
+
+Transcripción local de Whisper:
+{local_text}
+
+Reglas:
+- No inventes contenido.
+- Combiná ambas transcripciones en la mejor versión final.
+- Corregí errores obvios solo si una versión apoya a la otra.
+- Preservá nombres propios, IDs, URLs, montos, fechas y acciones.
+- Si hay duda, mantené la formulación más conservadora.
+- Devolvé solo la transcripción final, sin explicación.
+""".strip()
+
+    def build_best_audio_transcript(self, slack_text: str, local_text: str) -> str:
+        prompt = self.build_audio_fusion_prompt(slack_text, local_text)
+        response = self.get_audio_fusion_model().invoke(prompt)
+        if isinstance(response, AudioTranscriptFusion):
+            return compact_text(response.transcript, 8000)
+        if isinstance(response, str):
+            return response.strip()
+        if isinstance(response, dict):
+            return str(response.get("transcript") or "").strip()
+        return str(getattr(response, "transcript", "") or "").strip()
+
     def has_complete_trello_config(self) -> bool:
         return bool(
             self.config.trello_api_key
@@ -773,6 +910,174 @@ class AgentApp:
                 chat_id=self.config.telegram_chat_id,
             )
         return self._telegram_client
+
+    def audio_cache_dir(self) -> Path:
+        return Path(self.config.local_whisper_cache_dir).expanduser()
+
+    def download_audio_attachment(self, attachment: AudioAttachment) -> Path:
+        if not attachment.url_private:
+            raise RuntimeError("El audio no trae url_private ni url_private_download.")
+
+        cache_dir = self.audio_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        suffix = Path(attachment.filename).suffix or ".audio"
+        target = cache_dir / f"{attachment.file_id or attachment.index}{suffix}"
+        response = requests.get(
+            attachment.url_private,
+            timeout=(5, 60),
+            headers={"Authorization": f"Bearer {self.config.slack_user_token}"},
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Slack audio devolvió HTTP {response.status_code}: {response.text[:300]}")
+        target.write_bytes(response.content)
+        return target
+
+    def save_audio_transcription_result(
+        self,
+        result: AudioTranscriptResult,
+        *,
+        task_id: Optional[int] = None,
+    ) -> None:
+        attachment = result.attachment
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO audio_transcriptions (
+                    source,
+                    source_message_id,
+                    channel_id,
+                    message_ts,
+                    task_id,
+                    file_id,
+                    filename,
+                    mime_type,
+                    slack_transcript_text,
+                    local_transcript_text,
+                    fused_transcript_text,
+                    selected_transcript_text,
+                    transcription_status,
+                    transcription_error,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attachment.source,
+                    attachment.source_message_id,
+                    attachment.channel_id,
+                    attachment.message_ts,
+                    task_id,
+                    attachment.file_id,
+                    attachment.filename,
+                    attachment.mime_type,
+                    result.slack_transcript_text,
+                    result.local_transcript_text,
+                    result.fused_transcript_text,
+                    result.selected_transcript_text,
+                    result.transcription_status,
+                    result.transcription_error[:1000] if result.transcription_error else "",
+                    now_iso(),
+                ),
+            )
+
+    def transcribe_and_fuse_audio(
+        self,
+        attachment: AudioAttachment,
+        *,
+        task_id: Optional[int] = None,
+    ) -> AudioTranscriptResult:
+        slack_text = attachment.slack_transcript_text if self.config.slack_audio_transcripts_enabled else ""
+        local_text = ""
+        fused_text = ""
+        error = ""
+        downloaded_path: Optional[Path] = None
+
+        if self.config.local_whisper_enabled:
+            try:
+                if (
+                    attachment.duration_seconds is not None
+                    and attachment.duration_seconds > self.config.local_whisper_max_seconds
+                ):
+                    raise RuntimeError(
+                        f"El audio dura {attachment.duration_seconds:.0f}s y supera LOCAL_WHISPER_MAX_SECONDS."
+                    )
+                downloaded_path = self.download_audio_attachment(attachment)
+                local_text = self.get_audio_transcriber().transcribe(downloaded_path)
+            except Exception as exc:
+                error = str(exc)
+            finally:
+                if (
+                    downloaded_path
+                    and downloaded_path.exists()
+                    and not self.config.local_whisper_keep_audio_files
+                ):
+                    downloaded_path.unlink(missing_ok=True)
+
+        if slack_text and local_text and self.config.audio_transcript_fusion_enabled:
+            try:
+                fused_text = self.build_best_audio_transcript(slack_text, local_text)
+            except Exception as exc:
+                error = str(exc)
+
+        selected_text, status = choose_audio_transcript(
+            slack_text=slack_text,
+            local_text=local_text,
+            fused_text=fused_text,
+        )
+        if error and not selected_text:
+            status = "failed"
+        elif not selected_text:
+            status = "missing"
+
+        result = AudioTranscriptResult(
+            attachment=attachment,
+            slack_transcript_text=slack_text,
+            local_transcript_text=local_text,
+            fused_transcript_text=fused_text,
+            selected_transcript_text=selected_text,
+            transcription_status=status,
+            transcription_error=error,
+        )
+        self.save_audio_transcription_result(result, task_id=task_id)
+        return result
+
+    def enrich_message_with_audio(
+        self,
+        message: dict[str, Any],
+        conversation: dict[str, Any],
+        *,
+        task_id: Optional[int] = None,
+    ) -> dict[str, Any]:
+        if not self.config.audio_transcription_enabled:
+            return message
+
+        enriched_message = dict(message)
+        enriched_message.setdefault("channel", conversation.get("id", ""))
+        attachments = detect_audio_attachments(enriched_message)
+        if not attachments:
+            return enriched_message
+
+        results = [
+            self.transcribe_and_fuse_audio(attachment, task_id=task_id)
+            for attachment in attachments
+        ]
+        audio_text = format_audio_transcripts_for_message(results)
+        if not audio_text:
+            enriched_message["_audio_transcription_status"] = "missing"
+            return enriched_message
+
+        enriched_message["text"] = combine_text_and_audio(enriched_message.get("text", ""), audio_text)
+        enriched_message["_audio_transcript_added"] = True
+        return enriched_message
+
+    def transcribe_audio_path(self, audio_path: Path) -> str:
+        return self.get_audio_transcriber().transcribe(audio_path)
+
+    def transcribe_audio_folder(self, folder_path: Path) -> list[tuple[Path, str]]:
+        results = []
+        for path in sorted(item for item in folder_path.iterdir() if item.is_file()):
+            results.append((path, self.transcribe_audio_path(path)))
+        return results
 
     def slack_call(self, method: Callable[..., Any], **kwargs: Any) -> Any:
         while True:
@@ -1218,15 +1523,17 @@ class AgentApp:
         self.mark_task_acknowledged(task_id)
         return True
 
-    def send_context_acknowledgement(self, task_id: int, summary: str) -> bool:
+    def send_context_acknowledgement(self, task_id: int, summary: str, *, transcribed_audio: bool = False) -> bool:
         task_row = self.get_task_by_id(task_id)
         if not task_row:
             return False
 
-        text = (
-            "Buenísimo, gracias. Lo sumo al pedido. "
-            f"El registro queda como: ‘{compact_text(summary or 'el pedido', 180)}’."
+        prefix = (
+            "Buenísimo, transcribí el audio y lo sumo al pedido. "
+            if transcribed_audio
+            else "Buenísimo, gracias. Lo sumo al pedido. "
         )
+        text = prefix + f"El registro queda como: ‘{compact_text(summary or 'el pedido', 180)}’."
         try:
             self.slack_call(
                 self.slack.chat_postMessage,
@@ -1348,7 +1655,11 @@ class AgentApp:
             status="context_added",
             reason=f"Contexto agregado a tarea #{task_row['id']}.",
         )
-        self.send_context_acknowledgement(task_row["id"], summary)
+        self.send_context_acknowledgement(
+            task_row["id"],
+            summary,
+            transcribed_audio=bool(message.get("_audio_transcript_added")),
+        )
         return True
 
     def extract_message_links(self, text: str) -> list[MessageLink]:
@@ -1929,11 +2240,37 @@ class AgentApp:
             synced += int(self.sync_task_to_trello(row))
         return synced
 
-    def is_trello_card_done(self, card: TrelloCardState) -> bool:
+    def is_trello_card_done_by_check(self, card: TrelloCardState) -> bool:
+        return bool(card.due_complete)
+
+    def is_trello_card_done_by_list(self, card: TrelloCardState) -> bool:
         if self.config.trello_done_list_id and card.list_id == self.config.trello_done_list_id:
             return True
         normalized_list_name = normalize_for_matching(card.list_name)
         return bool(normalized_list_name and normalized_list_name in self.config.trello_done_list_names)
+
+    def is_trello_card_done_by_checklist(self, card: TrelloCardState) -> bool:
+        wanted = normalize_for_matching(self.config.trello_done_checklist_item_name)
+        if not wanted:
+            return False
+        for item in card.checklist_items:
+            item_name = normalize_for_matching(str(item.get("name") or ""))
+            item_state = normalize_for_matching(str(item.get("state") or ""))
+            if item_name == wanted and item_state == "complete":
+                return True
+        return False
+
+    def is_trello_card_done(self, card: TrelloCardState) -> bool:
+        mode = self.config.trello_done_mode
+        if mode == "check":
+            return self.is_trello_card_done_by_check(card)
+        if mode == "list":
+            return self.is_trello_card_done_by_list(card)
+        if mode == "checklist":
+            return self.is_trello_card_done_by_checklist(card)
+        if mode == "list_or_check":
+            return self.is_trello_card_done_by_check(card) or self.is_trello_card_done_by_list(card)
+        return False
 
     def mark_task_trello_check_failed(self, task_id: int, error_message: str) -> None:
         with self.db_connect() as conn:
@@ -2169,9 +2506,9 @@ class AgentApp:
     def is_human_message(self, message: dict[str, Any]) -> bool:
         if message.get("subtype"):
             return False
-        if not message.get("text"):
-            return False
-        return True
+        if message.get("text"):
+            return True
+        return bool(self.config.audio_transcription_enabled and message.get("files"))
 
     def build_classification_prompt(
         self,
@@ -2246,6 +2583,13 @@ Reglas:
                 **state,
                 "relevant": False,
                 "relevance_reason": "Mensaje enviado por Ivan.",
+            }
+
+        if not str(text or "").strip():
+            return {
+                **state,
+                "relevant": False,
+                "relevance_reason": "Mensaje sin texto transcripto.",
             }
 
         if conversation.get("is_im") or conversation.get("is_mpim"):
@@ -2431,17 +2775,27 @@ Reglas:
     def process_message(self, message: dict[str, Any], conversation: dict[str, Any], my_user_id: str) -> None:
         sender_label = self.user_label(message.get("user"))
         conversation_label = self.conversation_label(conversation)
-        state: AgentState = {
-            "message": message,
-            "conversation": conversation,
-            "my_user_id": my_user_id,
-            "sender_label": sender_label,
-            "conversation_label": conversation_label,
-        }
-
         try:
+            existing_case = None
             if message.get("user") != my_user_id or self.config.include_self_for_test:
                 existing_case = self.find_existing_case_for_message(message, conversation, sender_label)
+
+            message = self.enrich_message_with_audio(
+                message,
+                conversation,
+                task_id=existing_case["id"] if existing_case else None,
+            )
+            state: AgentState = {
+                "message": message,
+                "conversation": conversation,
+                "my_user_id": my_user_id,
+                "sender_label": sender_label,
+                "conversation_label": conversation_label,
+            }
+
+            if message.get("user") != my_user_id or self.config.include_self_for_test:
+                if existing_case is None:
+                    existing_case = self.find_existing_case_for_message(message, conversation, sender_label)
                 if existing_case:
                     self.add_context_to_task(
                         existing_case,
