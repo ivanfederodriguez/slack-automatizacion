@@ -81,8 +81,10 @@ def build_sync_worker_script(
     python_path: str,
     *,
     sync_worker_seconds: int,
+    sync_waiting_enabled: bool,
     sync_trello_done_enabled: bool,
     sync_telegram_poll_enabled: bool,
+    final_reply_mode: str,
 ) -> str:
     main_path = project_dir / "main.py"
     return f"""#!/bin/zsh
@@ -90,15 +92,21 @@ set -euo pipefail
 cd {shell_quote(str(project_dir))}
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 export SYNC_WORKER_SECONDS={shell_quote(str(sync_worker_seconds))}
+export SYNC_WAITING_ENABLED={shell_quote(bool_env(sync_waiting_enabled))}
 export SYNC_TRELLO_DONE_ENABLED={shell_quote(bool_env(sync_trello_done_enabled))}
 export SYNC_TELEGRAM_POLL_ENABLED={shell_quote(bool_env(sync_telegram_poll_enabled))}
+export FINAL_REPLY_MODE={shell_quote(final_reply_mode)}
 
 while true; do
+  if [[ "$SYNC_WAITING_ENABLED" == "true" ]]; then
+    {shell_quote(python_path)} {shell_quote(str(main_path))} trello-waiting-sync --limit 50 || echo "trello-waiting-sync failed with $?"
+  fi
+
   if [[ "$SYNC_TRELLO_DONE_ENABLED" == "true" ]]; then
     {shell_quote(python_path)} {shell_quote(str(main_path))} trello-done-sync --limit 50 || echo "trello-done-sync failed with $?"
   fi
 
-  if [[ "$SYNC_TELEGRAM_POLL_ENABLED" == "true" ]]; then
+  if [[ "$SYNC_TELEGRAM_POLL_ENABLED" == "true" && "$FINAL_REPLY_MODE" == "telegram_approval" ]]; then
     {shell_quote(python_path)} {shell_quote(str(main_path))} telegram-poll --limit 20 || echo "telegram-poll failed with $?"
   fi
 
@@ -139,8 +147,10 @@ def install_launch_agents(
     ollama_base_url: str,
     *,
     sync_worker_seconds: int = 60,
+    sync_waiting_enabled: bool = True,
     sync_trello_done_enabled: bool = True,
     sync_telegram_poll_enabled: bool = True,
+    final_reply_mode: str = "telegram_approval",
 ) -> LaunchArtifacts:
     ollama_path = shutil.which("ollama")
     if not ollama_path:
@@ -160,8 +170,10 @@ def install_launch_agents(
             project_dir,
             python_path,
             sync_worker_seconds=sync_worker_seconds,
+            sync_waiting_enabled=sync_waiting_enabled,
             sync_trello_done_enabled=sync_trello_done_enabled,
             sync_telegram_poll_enabled=sync_telegram_poll_enabled,
+            final_reply_mode=final_reply_mode,
         ),
         encoding="utf-8",
     )

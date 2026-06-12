@@ -33,7 +33,7 @@ from audio_transcription import (
     detect_local_whisper_backend,
     format_audio_transcripts_for_message,
 )
-from trello_client import TrelloCard, TrelloCardState, TrelloClient, TrelloError, build_trello_token_url
+from trello_client import TrelloCard, TrelloCardState, TrelloClient, TrelloComment, TrelloError, build_trello_token_url
 from url_enrichment import (
     MessageLink,
     classify_url,
@@ -184,6 +184,9 @@ class TrelloClientProtocol(Protocol):
     def add_card_comment(self, card_id: str, text: str) -> None:
         ...
 
+    def get_card_comments(self, card_id: str, limit: int = 50) -> list[TrelloComment]:
+        ...
+
 
 class TelegramClientProtocol(Protocol):
     def send_message(self, text: str) -> Any:
@@ -293,9 +296,13 @@ class AgentConfig:
     trello_done_checklist_item_name: str = "Hecho"
     trello_done_list_id: str = ""
     trello_done_list_names: tuple[str, ...] = ("hecho", "done")
+    trello_waiting_enabled: bool = True
+    trello_waiting_comment_prefix: str = "Pedir:"
+    trello_waiting_auto_clear: bool = True
     telegram_enabled: bool = False
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    final_reply_mode: Literal["telegram_approval", "slack_auto"] = "telegram_approval"
     audio_transcription_enabled: bool = True
     slack_audio_transcripts_enabled: bool = True
     local_whisper_enabled: bool = True
@@ -309,6 +316,7 @@ class AgentConfig:
     audio_transcript_fusion_enabled: bool = True
     audio_transcript_fusion_model: str = "main"
     sync_worker_seconds: int = 60
+    sync_waiting_enabled: bool = True
     sync_trello_done_enabled: bool = True
     sync_telegram_poll_enabled: bool = True
     db_path: str = DB_PATH
@@ -329,6 +337,10 @@ class AgentConfig:
         trello_done_mode = (get("TRELLO_DONE_MODE", "check") or "check").strip().lower()
         if trello_done_mode not in {"check", "list", "checklist", "list_or_check"}:
             raise ConfigError("TRELLO_DONE_MODE debe ser check, list, checklist o list_or_check.")
+
+        final_reply_mode = (get("FINAL_REPLY_MODE", "telegram_approval") or "telegram_approval").strip().lower()
+        if final_reply_mode not in {"telegram_approval", "slack_auto"}:
+            raise ConfigError("FINAL_REPLY_MODE debe ser telegram_approval o slack_auto.")
 
         poll_seconds_raw = (get("POLL_SECONDS", "300") or "300").strip()
         sleep_seconds_raw = (get("SLACK_SLEEP_SECONDS", "1.2") or "1.2").strip()
@@ -422,9 +434,13 @@ class AgentConfig:
             ).strip(),
             trello_done_list_id=(get("TRELLO_DONE_LIST_ID", "") or "").strip(),
             trello_done_list_names=trello_done_list_names or ("hecho", "done"),
+            trello_waiting_enabled=parse_bool(get("TRELLO_WAITING_ENABLED", "true") or "true"),
+            trello_waiting_comment_prefix=(get("TRELLO_WAITING_COMMENT_PREFIX", "Pedir:") or "Pedir:").strip(),
+            trello_waiting_auto_clear=parse_bool(get("TRELLO_WAITING_AUTO_CLEAR", "true") or "true"),
             telegram_enabled=parse_bool(get("TELEGRAM_ENABLED", "false") or "false"),
             telegram_bot_token=(get("TELEGRAM_BOT_TOKEN", "") or "").strip(),
             telegram_chat_id=(get("TELEGRAM_CHAT_ID", "") or "").strip(),
+            final_reply_mode=final_reply_mode,  # type: ignore[arg-type]
             audio_transcription_enabled=parse_bool(get("AUDIO_TRANSCRIPTION_ENABLED", "true") or "true"),
             slack_audio_transcripts_enabled=parse_bool(get("SLACK_AUDIO_TRANSCRIPTS_ENABLED", "true") or "true"),
             local_whisper_enabled=parse_bool(get("LOCAL_WHISPER_ENABLED", "true") or "true"),
@@ -444,6 +460,7 @@ class AgentConfig:
             audio_transcript_fusion_enabled=parse_bool(get("AUDIO_TRANSCRIPT_FUSION_ENABLED", "true") or "true"),
             audio_transcript_fusion_model=(get("AUDIO_TRANSCRIPT_FUSION_MODEL", "main") or "main").strip(),
             sync_worker_seconds=sync_worker_seconds,
+            sync_waiting_enabled=parse_bool(get("SYNC_WAITING_ENABLED", "true") or "true"),
             sync_trello_done_enabled=parse_bool(get("SYNC_TRELLO_DONE_ENABLED", "true") or "true"),
             sync_telegram_poll_enabled=parse_bool(get("SYNC_TELEGRAM_POLL_ENABLED", "true") or "true"),
             db_path=(get("DB_PATH", DB_PATH) or DB_PATH).strip(),
@@ -676,6 +693,12 @@ class AgentApp:
             self._ensure_column(conn, "tasks", "telegram_error", "telegram_error TEXT")
             self._ensure_column(conn, "tasks", "public_request_text", "public_request_text TEXT")
             self._ensure_column(conn, "tasks", "has_audio_transcript", "has_audio_transcript INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "tasks", "waiting_requested_at", "waiting_requested_at TEXT")
+            self._ensure_column(conn, "tasks", "waiting_request_text", "waiting_request_text TEXT")
+            self._ensure_column(conn, "tasks", "waiting_request_message_ts", "waiting_request_message_ts TEXT")
+            self._ensure_column(conn, "tasks", "waiting_trello_action_id", "waiting_trello_action_id TEXT")
+            self._ensure_column(conn, "tasks", "waiting_cleared_at", "waiting_cleared_at TEXT")
+            self._ensure_column(conn, "tasks", "waiting_error", "waiting_error TEXT")
 
             conn.execute(
                 """
@@ -1677,6 +1700,125 @@ Reglas:
         self.mark_task_context_acknowledged(task_id)
         return True
 
+    def waiting_request_from_comment(self, comment_text: str) -> str:
+        prefix = self.config.trello_waiting_comment_prefix.strip()
+        text = str(comment_text or "").strip()
+        if not prefix or not text.lower().startswith(prefix.lower()):
+            return ""
+        return text[len(prefix):].strip()
+
+    def build_waiting_request_slack_text(self, task_row: sqlite3.Row, waiting_request_text: str) -> str:
+        mention = ""
+        requester_user_id = task_row["requester_user_id"] or task_row["user_id"] or ""
+        if self.requester_needs_mention(task_row) and requester_user_id:
+            mention = f"<@{requester_user_id}> "
+        return (
+            f"{mention}Para poder avanzar, necesito que me pases esto:\n\n"
+            f"{waiting_request_text}\n\n"
+            "Cuando me lo compartas por este hilo, lo sumo al pedido."
+        )
+
+    def mark_task_waiting_requested(
+        self,
+        task_id: int,
+        *,
+        waiting_request_text: str,
+        waiting_request_message_ts: str,
+        waiting_trello_action_id: str,
+    ) -> None:
+        timestamp = now_iso()
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'waiting_for_requester',
+                    waiting_requested_at = ?,
+                    waiting_request_text = ?,
+                    waiting_request_message_ts = ?,
+                    waiting_trello_action_id = ?,
+                    waiting_cleared_at = NULL,
+                    waiting_error = NULL,
+                    updated_at = ?,
+                    snoozed_until = NULL
+                WHERE id = ?
+                """,
+                (
+                    timestamp,
+                    waiting_request_text,
+                    waiting_request_message_ts,
+                    waiting_trello_action_id,
+                    timestamp,
+                    task_id,
+                ),
+            )
+        self.record_task_event(
+            task_id,
+            "waiting_requested",
+            {
+                "waiting_request_text": waiting_request_text,
+                "waiting_request_message_ts": waiting_request_message_ts,
+                "waiting_trello_action_id": waiting_trello_action_id,
+            },
+        )
+
+    def mark_task_waiting_failed(self, task_id: int, error_message: str) -> None:
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET waiting_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (error_message[:1000], now_iso(), task_id),
+            )
+        self.record_task_event(task_id, "waiting_request_failed", {"error": error_message[:1000]})
+
+    def mark_task_waiting_cleared(self, task_id: int) -> None:
+        timestamp = now_iso()
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'new',
+                    waiting_cleared_at = ?,
+                    waiting_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, timestamp, task_id),
+            )
+        self.record_task_event(task_id, "waiting_cleared", {})
+
+    def send_waiting_request_to_slack(
+        self,
+        task_row: sqlite3.Row,
+        *,
+        waiting_request_text: str,
+        waiting_trello_action_id: str,
+    ) -> bool:
+        try:
+            response = self.slack_call(
+                self.slack.chat_postMessage,
+                channel=task_row["channel_id"],
+                thread_ts=task_row["thread_ts"] or task_row["message_ts"],
+                text=self.build_waiting_request_slack_text(task_row, waiting_request_text),
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+        except Exception as exc:
+            self.mark_task_waiting_failed(task_row["id"], str(exc))
+            print(f"[yellow]No pude pedir información en Slack para tarea #{task_row['id']}: {exc}[/yellow]")
+            return False
+
+        self.mark_task_waiting_requested(
+            task_row["id"],
+            waiting_request_text=waiting_request_text,
+            waiting_request_message_ts=str(response.get("ts") or ""),
+            waiting_trello_action_id=waiting_trello_action_id,
+        )
+        return True
+
     def mark_task_trello_context_failed(self, task_id: int, error_message: str) -> None:
         with self.db_connect() as conn:
             conn.execute(
@@ -1696,13 +1838,16 @@ Reglas:
         if not card_id:
             return
 
-        comment = "\n".join(
-            [
-                "Contexto agregado desde Slack:",
-                "",
-                f"{sender_label}: {text.strip()}",
-            ]
-        )
+        if task_row["status"] == "waiting_for_requester":
+            comment = f"Respuesta recibida desde Slack: {text.strip()}"
+        else:
+            comment = "\n".join(
+                [
+                    "Contexto agregado desde Slack:",
+                    "",
+                    f"{sender_label}: {text.strip()}",
+                ]
+            )
         try:
             self.get_trello_client().add_card_comment(card_id, comment)
         except Exception as exc:
@@ -1795,6 +1940,8 @@ Reglas:
             summary,
             transcribed_audio=bool(message.get("_audio_transcript_added")),
         )
+        if task_row["status"] == "waiting_for_requester" and self.config.trello_waiting_auto_clear:
+            self.mark_task_waiting_cleared(task_row["id"])
         return True
 
     def extract_message_links(self, text: str) -> list[MessageLink]:
@@ -2075,6 +2222,7 @@ Reglas:
             "snoozed",
             "reply_approved",
             "done_pending_reply",
+            "waiting_for_requester",
         )
 
     def requester_needs_mention(self, task_row: sqlite3.Row) -> bool:
@@ -2562,6 +2710,94 @@ Reglas:
         self.mark_task_telegram_notified(task_id)
         return True
 
+    def sync_trello_waiting_requests(self, limit: int = 50) -> int:
+        if not self.config.trello_enabled or not self.config.trello_waiting_enabled:
+            return 0
+
+        with self.db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT tasks.*,
+                       processed_messages.raw_text,
+                       processed_messages.context_text
+                FROM tasks
+                LEFT JOIN processed_messages
+                  ON processed_messages.channel_id = tasks.channel_id
+                 AND processed_messages.message_ts = tasks.message_ts
+                WHERE tasks.trello_card_id IS NOT NULL
+                  AND tasks.trello_card_id != ''
+                  AND COALESCE(tasks.status, 'new') NOT IN (
+                    'done',
+                    'ignored',
+                    'dismissed',
+                    'archived',
+                    'responded',
+                    'done_pending_reply'
+                  )
+                ORDER BY tasks.id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        requested = 0
+        for row in rows:
+            if row["status"] == "waiting_for_requester":
+                continue
+            try:
+                comments = self.get_trello_client().get_card_comments(row["trello_card_id"], limit=25)
+            except Exception as exc:
+                self.mark_task_waiting_failed(row["id"], str(exc))
+                print(f"[yellow]No pude leer comentarios Trello para tarea #{row['id']}: {exc}[/yellow]")
+                continue
+
+            waiting_comment = None
+            waiting_text = ""
+            for comment in sorted(comments, key=lambda item: item.date or "", reverse=True):
+                text = self.waiting_request_from_comment(comment.text)
+                if text:
+                    waiting_comment = comment
+                    waiting_text = text
+                    break
+
+            if not waiting_comment or not waiting_text:
+                continue
+            if waiting_comment.id and waiting_comment.id == (row["waiting_trello_action_id"] or ""):
+                continue
+
+            if self.send_waiting_request_to_slack(
+                row,
+                waiting_request_text=waiting_text,
+                waiting_trello_action_id=waiting_comment.id,
+            ):
+                requested += 1
+
+        return requested
+
+    def build_slack_auto_final_reply_text(self, task_row: sqlite3.Row) -> str:
+        public_request_text = task_row["public_request_text"] or self.build_public_request_text(task_row=task_row)
+        return f"Listo, ya quedó resuelto.\n\nPetición resuelta:\n{public_request_text}"
+
+    def send_slack_auto_final_reply(self, task_row: sqlite3.Row) -> bool:
+        try:
+            response = self.slack_call(
+                self.slack.chat_postMessage,
+                channel=task_row["channel_id"],
+                thread_ts=task_row["thread_ts"] or task_row["message_ts"],
+                text=self.build_slack_auto_final_reply_text(task_row),
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+        except Exception as exc:
+            self.mark_task_reply_failed(task_row["id"], str(exc))
+            print(f"[yellow]No pude enviar cierre automático Slack para tarea #{task_row['id']}: {exc}[/yellow]")
+            return False
+
+        reply_ts = str(response.get("ts") or "")
+        self.mark_task_reply_sent(task_row["id"], reply_ts)
+        self.record_task_event(task_row["id"], "slack_auto_final_reply_sent", {"reply_ts": reply_ts})
+        return True
+
     def sync_trello_done_tasks(self, limit: int = 50) -> int:
         if not self.config.trello_enabled:
             return 0
@@ -2594,6 +2830,8 @@ Reglas:
 
         moved = 0
         for row in rows:
+            if row["status"] == "waiting_for_requester":
+                continue
             try:
                 card = self.get_trello_client().get_card(row["trello_card_id"])
             except Exception as exc:
@@ -2602,6 +2840,10 @@ Reglas:
                 continue
 
             if not self.is_trello_card_done(card):
+                continue
+
+            if self.config.final_reply_mode == "slack_auto":
+                moved += int(self.send_slack_auto_final_reply(row))
                 continue
 
             final_reply = self.build_final_reply_suggestion(row)
@@ -3083,8 +3325,11 @@ Reglas:
         if self.config.trello_enabled and self.config.trello_auto_create:
             self.sync_pending_trello_tasks(limit=25)
         if self.config.trello_enabled:
+            if self.config.sync_waiting_enabled:
+                self.sync_trello_waiting_requests(limit=25)
             self.sync_trello_done_tasks(limit=25)
-        self.poll_telegram_updates(limit=25)
+        if self.config.final_reply_mode == "telegram_approval":
+            self.poll_telegram_updates(limit=25)
         total_new = 0
 
         for conversation in conversations:
@@ -3132,8 +3377,11 @@ Reglas:
         if self.config.trello_enabled and self.config.trello_auto_create:
             self.sync_pending_trello_tasks(limit=25)
         if self.config.trello_enabled:
+            if self.config.sync_waiting_enabled:
+                self.sync_trello_waiting_requests(limit=25)
             self.sync_trello_done_tasks(limit=25)
-        self.poll_telegram_updates(limit=25)
+        if self.config.final_reply_mode == "telegram_approval":
+            self.poll_telegram_updates(limit=25)
         print(f"[green]Poll terminado.[/green] Mensajes humanos nuevos procesados: {total_new}")
 
     def fetch_open_tasks_for_brief(self, limit: int = 200) -> list[sqlite3.Row]:
@@ -3670,6 +3918,8 @@ Reglas:
         return False
 
     def poll_telegram_updates(self, limit: int = 20) -> int:
+        if self.config.final_reply_mode != "telegram_approval":
+            return 0
         if not self.config.telegram_enabled or not self.has_telegram_config():
             return 0
 
@@ -3925,8 +4175,10 @@ Reglas:
             project_dir=Path(__file__).resolve().parent,
             ollama_base_url=self.config.ollama_base_url,
             sync_worker_seconds=self.config.sync_worker_seconds,
+            sync_waiting_enabled=self.config.sync_waiting_enabled,
             sync_trello_done_enabled=self.config.sync_trello_done_enabled,
             sync_telegram_poll_enabled=self.config.sync_telegram_poll_enabled,
+            final_reply_mode=self.config.final_reply_mode,
         )
         print("[green]Autostart instalado.[/green]")
         print(f"Ollama plist: {artifacts.ollama_plist}")
@@ -3980,6 +4232,11 @@ Reglas:
                 "Si Slack devuelve missing_scope con needed=chat:write:bot, reinstalá/actualizá "
                 "la app o el token con ese permiso.[/yellow]"
             )
+            if self.config.final_reply_mode == "slack_auto":
+                print(
+                    "[yellow]FINAL_REPLY_MODE=slack_auto está activo: cuando Trello esté marcado "
+                    "como hecho, el cierre final se enviará directo a Slack.[/yellow]"
+                )
         except Exception as exc:
             ok = False
             print(f"[red]Slack auth falló:[/red] {exc}")
@@ -4058,6 +4315,26 @@ Reglas:
                     else:
                         ok = False
                         print("[yellow]Falta TRELLO_LIST_ID. Usá `python main.py trello-lists` para descubrirlo.[/yellow]")
+                    if self.config.trello_waiting_enabled:
+                        print("[bold]Chequeo Trello waiting[/bold]")
+                        with self.db_connect() as conn:
+                            sample = conn.execute(
+                                """
+                                SELECT trello_card_id
+                                FROM tasks
+                                WHERE trello_card_id IS NOT NULL AND trello_card_id != ''
+                                ORDER BY id DESC
+                                LIMIT 1
+                                """
+                            ).fetchone()
+                        if sample:
+                            client.get_card_comments(sample["trello_card_id"], limit=1)
+                            print("[green]Lectura de comentarios Trello OK[/green]")
+                        else:
+                            print(
+                                "[yellow]No hay cards locales para probar lectura de comentarios. "
+                                "TRELLO_WAITING_ENABLED requiere token Trello con scope read.[/yellow]"
+                            )
                 except Exception as exc:
                     ok = False
                     print(f"[red]Trello falló:[/red] {exc}")

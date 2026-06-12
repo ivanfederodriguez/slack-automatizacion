@@ -89,6 +89,7 @@ SLACK_SLEEP_SECONDS=1.2
 INCLUDE_SELF_FOR_TEST=false
 CASE_GROUPING_WINDOW_MINUTES=15
 SLACK_SEND_APPROVED_REPLIES=false
+FINAL_REPLY_MODE=telegram_approval
 
 # Trello opcional
 TRELLO_ENABLED=false
@@ -103,6 +104,9 @@ TRELLO_DONE_MODE=check
 TRELLO_DONE_CHECKLIST_ITEM_NAME=Hecho
 TRELLO_DONE_LIST_ID=
 TRELLO_DONE_LIST_NAMES=Hecho,Done
+TRELLO_WAITING_ENABLED=true
+TRELLO_WAITING_COMMENT_PREFIX=Pedir:
+TRELLO_WAITING_AUTO_CLEAR=true
 
 # Telegram opcional
 TELEGRAM_ENABLED=false
@@ -111,6 +115,7 @@ TELEGRAM_CHAT_ID=
 
 # Sync worker
 SYNC_WORKER_SECONDS=60
+SYNC_WAITING_ENABLED=true
 SYNC_TRELLO_DONE_ENABLED=true
 SYNC_TELEGRAM_POLL_ENABLED=true
 
@@ -138,14 +143,17 @@ Notas utiles:
 - la base local por defecto es `slack_agent.db`;
 - en DMs, mensajes del mismo requester dentro de `CASE_GROUPING_WINDOW_MINUTES` se agrupan en el mismo caso aunque Slack no mande thread;
 - si `TRELLO_ENABLED=false`, todo el flujo principal sigue funcionando sin Trello;
-- si `TELEGRAM_ENABLED=false`, las tareas hechas quedan en `done_pending_reply` con error auditado hasta configurar Telegram o cerrarlas manualmente.
+- `FINAL_REPLY_MODE=telegram_approval` mantiene aprobacion por Telegram; `FINAL_REPLY_MODE=slack_auto` responde directo en Slack cuando Ivan marca la card como hecha.
 
 ## Flujo conversacional
 
 Cuando detecta una tarea accionable nueva, el agente responde en el thread original:
 
 ```text
-Dale, lo tomo. Lo registre como: '{summary}'. Si queres, podes agregar contexto en este mismo hilo.
+Dale, lo tomo. Lo deje registrado para revisarlo. Si queres, podes agregar contexto en este mismo hilo.
+
+Peticion registrada:
+{public_request_text}
 ```
 
 En DM no menciona al solicitante. En canales privados y group DMs antepone `<@user_id>`.
@@ -153,18 +161,52 @@ En DM no menciona al solicitante. En canales privados y group DMs antepone `<@us
 Si llega contexto nuevo en el mismo thread, actualiza la tarea existente, agrega comentario en Trello si la card existe y confirma:
 
 ```text
-Buenisimo, gracias. Lo sumo al pedido. El registro queda como: '{summary_actualizado}'.
+Buenisimo, gracias. Lo sumo al pedido.
+
+Peticion actualizada:
+{public_request_text}
 ```
 
-Cuando una card queda marcada como hecha segun `TRELLO_DONE_MODE`, la tarea cambia a `done_pending_reply`. El modo recomendado es `check`, que usa el check nativo de Trello (`dueComplete`). Tambien siguen disponibles `list`, `checklist` y `list_or_check` para compatibilidad.
+Cuando una card queda marcada como hecha segun `TRELLO_DONE_MODE`, el modo recomendado es `check`, que usa el check nativo de Trello (`dueComplete`). En `FINAL_REPLY_MODE=telegram_approval`, la tarea cambia a `done_pending_reply` y pasa por Telegram. En `FINAL_REPLY_MODE=slack_auto`, el agente manda el cierre directo en Slack.
 
-El agente no contesta Slack al detectar una card hecha: prepara un cierre seguro y manda Telegram a Ivan con:
+Con `FINAL_REPLY_MODE=telegram_approval`, el agente no contesta Slack al detectar una card hecha: prepara un cierre seguro y manda Telegram a Ivan con:
 
 ```text
 /send TASK_ID
 /edit TASK_ID texto
 /nosend TASK_ID
 ```
+
+## Trello operativo
+
+Trello queda como tablero operativo de Ivan con dos señales simples:
+
+- comentario `Pedir:` significa pedir informacion al requester y dejar la tarea en `waiting_for_requester`;
+- check nativo de Trello significa request completa y lista para cierre.
+
+No se usan checklists para waiting. Un check nunca significa waiting, y un comentario `Pedir:` nunca significa done.
+
+Para pedir informacion:
+
+1. Abrir la card en Trello.
+2. Agregar un comentario como `Pedir: ¿Me pasás el link del registro y el usuario?`.
+3. El agente manda esa pregunta al hilo original de Slack.
+4. La task queda en `waiting_for_requester`.
+5. Cuando la persona responde por Slack, el agente suma el contexto, comenta en Trello `Respuesta recibida desde Slack: ...` y vuelve la tarea a `new`.
+
+Para cerrar:
+
+1. Marcar el check nativo de Trello.
+2. Si `FINAL_REPLY_MODE=slack_auto`, el agente responde en Slack:
+
+```text
+Listo, ya quedo resuelto.
+
+Peticion resuelta:
+{public_request_text}
+```
+
+3. Si `FINAL_REPLY_MODE=telegram_approval`, el cierre queda pendiente de aprobacion por Telegram.
 
 ## Configurar Telegram
 
@@ -189,13 +231,17 @@ Si usas un chat 1:1 con el bot, el `chat_id` suele ser un entero positivo. Si us
 
 `python main.py trello-done-sync --limit 50`
 
-Chequea cards ya creadas en Trello y, si alguna queda hecha segun `TRELLO_DONE_MODE`, mueve la tarea a `done_pending_reply` y dispara la notificacion de Telegram. Sirve para probar el flujo manualmente o para resincronizar si el loop no estuvo corriendo.
+Chequea cards ya creadas en Trello y, si alguna queda hecha segun `TRELLO_DONE_MODE`, cierra segun `FINAL_REPLY_MODE`: Slack directo o Telegram approval. Sirve para probar el flujo manualmente o para resincronizar si el loop no estuvo corriendo.
+
+`python main.py trello-waiting-sync --limit 50`
+
+Lee comentarios recientes de Trello y procesa el comentario mas nuevo que empiece con `Pedir:` para iniciar un ciclo `waiting_for_requester`.
 
 `python main.py telegram-poll --limit 20`
 
 Lee comandos pendientes del bot de Telegram y procesa `/send`, `/edit` y `/nosend`. Es util para probar aprobaciones manualmente o para destrabar mensajes si queres correr Telegram por separado.
 
-Las respuestas finales no se envian automaticamente. El agente solo manda el mensaje final a Slack cuando Ivan usa `/send TASK_ID` o cuando se dispara un envio manual explicito por el flujo seguro existente.
+Las respuestas finales no se envian automaticamente cuando `FINAL_REPLY_MODE=telegram_approval`. Con `FINAL_REPLY_MODE=slack_auto`, el check nativo de Trello envia el cierre directo a Slack.
 
 ## Worker de sync
 
@@ -208,12 +254,13 @@ Las respuestas finales no se envian automaticamente. El agente solo manda el men
 El worker de sync ejecuta en loop:
 
 ```bash
+python main.py trello-waiting-sync --limit 50
 python main.py trello-done-sync --limit 50
 python main.py telegram-poll --limit 20
 sleep "$SYNC_WORKER_SECONDS"
 ```
 
-Podés apagar una mitad del worker con `SYNC_TRELLO_DONE_ENABLED=false` o `SYNC_TELEGRAM_POLL_ENABLED=false`. Los logs quedan separados en `runtime/logs/sync.stdout.log` y `runtime/logs/sync.stderr.log`.
+Podés apagar partes del worker con `SYNC_WAITING_ENABLED=false`, `SYNC_TRELLO_DONE_ENABLED=false` o `SYNC_TELEGRAM_POLL_ENABLED=false`. Si `FINAL_REPLY_MODE=slack_auto`, `telegram-poll` no se ejecuta aunque Telegram este configurado. Los logs quedan separados en `runtime/logs/sync.stdout.log` y `runtime/logs/sync.stderr.log`.
 
 ## Audio
 
@@ -324,6 +371,7 @@ python main.py tasks --limit 20
 python main.py trello-auth-url
 python main.py trello-lists
 python main.py trello-sync --limit 20
+python main.py trello-waiting-sync --limit 50
 python main.py trello-done-sync --limit 50
 python main.py telegram-poll --limit 20
 python main.py transcribe-audio /ruta/audio.m4a
@@ -350,6 +398,12 @@ La base ya guarda informacion para auditar el flujo de respuesta:
 - `done_pending_reply_at`
 - `final_reply_suggestion`
 - `telegram_error`
+- `waiting_requested_at`
+- `waiting_request_text`
+- `waiting_request_message_ts`
+- `waiting_trello_action_id`
+- `waiting_cleared_at`
+- `waiting_error`
 
 La tabla `audio_transcriptions` guarda la auditoria de audios: transcript de Slack, transcript local, transcript fusionado, texto seleccionado, estado y error si aplica.
 
@@ -357,6 +411,7 @@ Estados utiles:
 
 - `new`
 - `reply_approved`
+- `waiting_for_requester`
 - `done_pending_reply`
 - `responded`
 - `ignored`

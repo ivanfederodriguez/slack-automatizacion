@@ -89,11 +89,17 @@ def test_run_sync_worker_executes_trello_done_sync_and_telegram_poll(tmp_path):
         project_dir,
         python_path=str(project_dir / ".venv" / "bin" / "python"),
         sync_worker_seconds=60,
+        sync_waiting_enabled=True,
         sync_trello_done_enabled=True,
         sync_telegram_poll_enabled=True,
+        final_reply_mode="telegram_approval",
     )
 
     assert "while true; do" in script
+    assert (
+        f"'{project_dir / '.venv' / 'bin' / 'python'}' '{project_dir / 'main.py'}' trello-waiting-sync --limit 50"
+        in script
+    )
     assert (
         f"'{project_dir / '.venv' / 'bin' / 'python'}' '{project_dir / 'main.py'}' trello-done-sync --limit 50"
         in script
@@ -102,4 +108,6 @@ def test_run_sync_worker_executes_trello_done_sync_and_telegram_poll(tmp_path):
         f"'{project_dir / '.venv' / 'bin' / 'python'}' '{project_dir / 'main.py'}' telegram-poll --limit 20"
         in script
     )
+    assert script.index("trello-waiting-sync --limit 50") < script.index("trello-done-sync --limit 50")
+    assert '"$FINAL_REPLY_MODE" == "telegram_approval"' in script
     assert 'sleep "$SYNC_WORKER_SECONDS"' in script

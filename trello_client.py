@@ -34,6 +34,16 @@ class TrelloCardState:
 
 
 @dataclass(frozen=True)
+class TrelloComment:
+    id: str
+    text: str
+    date: str
+    member_id: str = ""
+    member_username: str = ""
+    member_full_name: str = ""
+
+
+@dataclass(frozen=True)
 class TrelloList:
     id: str
     name: str
@@ -162,6 +172,34 @@ class TrelloClient:
             f"/cards/{card_id}/actions/comments",
             json_body={"text": text},
         )
+
+    def get_card_comments(self, card_id: str, limit: int = 50) -> list[TrelloComment]:
+        payload = self._request(
+            "GET",
+            f"/cards/{card_id}/actions",
+            params={
+                "filter": "commentCard",
+                "limit": str(limit),
+                "fields": "date,data,idMemberCreator",
+                "memberCreator": "true",
+                "memberCreator_fields": "username,fullName",
+            },
+        )
+        comments = []
+        for action in payload or []:
+            data = action.get("data") or {}
+            member = action.get("memberCreator") or {}
+            comments.append(
+                TrelloComment(
+                    id=str(action.get("id") or ""),
+                    text=str(data.get("text") or ""),
+                    date=str(action.get("date") or ""),
+                    member_id=str(action.get("idMemberCreator") or ""),
+                    member_username=str(member.get("username") or ""),
+                    member_full_name=str(member.get("fullName") or ""),
+                )
+            )
+        return comments
 
 
 def build_trello_token_url(api_key: str) -> str:
