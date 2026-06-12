@@ -232,7 +232,9 @@ def insert_task(
     created_at,
     message_ts,
     summary,
+    public_request_text=None,
     requested_action,
+    has_audio_transcript=0,
     priority,
     category,
     classification,
@@ -255,7 +257,9 @@ def insert_task(
                 sender_label,
                 conversation_label,
                 summary,
+                public_request_text,
                 requested_action,
+                has_audio_transcript,
                 priority,
                 category,
                 status,
@@ -265,7 +269,7 @@ def insert_task(
                 trello_last_error,
                 classification_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 created_at,
@@ -275,7 +279,9 @@ def insert_task(
                 sender_label,
                 conversation_label,
                 summary,
+                public_request_text or summary,
                 requested_action,
+                has_audio_transcript,
                 priority,
                 category,
                 status,
@@ -363,7 +369,8 @@ def test_new_dm_task_sends_automatic_ack_without_mention(tmp_path):
     assert task["acknowledged_at"]
     assert fake_slack.post_calls[0]["channel"] == "D123"
     assert fake_slack.post_calls[0]["thread_ts"] == "1.2"
-    assert fake_slack.post_calls[0]["text"].startswith("Dale, lo tomo.")
+    assert "Petición registrada:" in fake_slack.post_calls[0]["text"]
+    assert "Lo dejé registrado para revisarlo" in fake_slack.post_calls[0]["text"]
     assert "<@UOTHER>" not in fake_slack.post_calls[0]["text"]
 
 
@@ -385,6 +392,7 @@ def test_new_private_channel_task_ack_mentions_requester(tmp_path):
     )
 
     assert fake_slack.post_calls[0]["text"].startswith("<@UOTHER> Dale, lo tomo.")
+    assert "Petición registrada:" in fake_slack.post_calls[0]["text"]
 
 
 def test_new_group_dm_task_ack_mentions_requester(tmp_path):
@@ -405,6 +413,81 @@ def test_new_group_dm_task_ack_mentions_requester(tmp_path):
     )
 
     assert fake_slack.post_calls[0]["text"].startswith("<@UOTHER> Dale, lo tomo.")
+    assert "Petición registrada:" in fake_slack.post_calls[0]["text"]
+
+
+def test_send_task_acknowledgement_uses_public_request_text_without_truncation(tmp_path):
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    long_request = (
+        "Modificar los links de formularios en la actualización compartida, verificando que cada "
+        "link apunte al formulario correcto y que no se rompa el flujo de carga para el equipo."
+    )
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="1.45",
+        summary="Luciana Santos pide a Ivan Rodríguez que modifique los links de formularios...",
+        public_request_text=long_request,
+        requested_action="Modificar los links de formularios en la actualización compartida.",
+        priority="medium",
+        category="admin",
+        classification=make_classification(
+            summary="Luciana Santos pide a Ivan Rodríguez que modifique los links de formularios...",
+            requested_action="Modificar los links de formularios en la actualización compartida.",
+            category="admin",
+        ),
+    )
+
+    app.send_task_acknowledgement(1)
+
+    text = fake_slack.post_calls[0]["text"]
+    assert "Petición registrada:" in text
+    assert long_request in text
+    assert "Luciana Santos pide a Ivan Rodríguez" not in text
+    assert "..." not in text
+    assert "compact_text" not in text
+
+
+def test_send_task_acknowledgement_uses_audio_copy_when_audio_was_transcribed(tmp_path):
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="1.46",
+        summary="Explicar en lenguaje simple la API de Salesforce.",
+        public_request_text="Explicar en lenguaje simple la API de Salesforce.",
+        requested_action="Explicar en lenguaje simple la API de Salesforce.",
+        priority="medium",
+        category="communications",
+        classification=make_classification(
+            summary="Explicar en lenguaje simple la API de Salesforce.",
+            requested_action="Explicar en lenguaje simple la API de Salesforce.",
+            category="communications",
+        ),
+    )
+    with sqlite3.connect(app.config.db_path) as conn:
+        conn.execute(
+            "UPDATE tasks SET has_audio_transcript = 1 WHERE id = 1",
+        )
+
+    app.send_task_acknowledgement(1)
+
+    text = fake_slack.post_calls[0]["text"]
+    assert "Transcribí el audio y lo dejé registrado para revisarlo" in text
 
 
 def test_thread_context_updates_existing_task_without_duplicate_and_confirms(tmp_path):
@@ -457,8 +540,8 @@ def test_thread_context_updates_existing_task_without_duplicate_and_confirms(tmp
     assert len(fake_model.calls) == 1
     assert processed_context["classification_status"] == "context_added"
     assert task["last_context_ack_at"]
-    assert "Buenísimo, gracias" in fake_slack.post_calls[1]["text"]
-    assert "Hay que revisar un reporte" in fake_slack.post_calls[1]["text"]
+    assert "Petición actualizada:" in fake_slack.post_calls[1]["text"]
+    assert "Buenísimo, gracias. Lo sumo al pedido." in fake_slack.post_calls[1]["text"]
     assert len(context_events) == 1
     assert fake_trello.comments[0]["card_id"] == "card123"
     assert "reporte de mayo" in fake_trello.comments[0]["text"]
@@ -501,7 +584,8 @@ def test_consecutive_dm_messages_from_same_sender_group_into_one_task(tmp_path):
     assert second_message["classification_status"] == "context_added"
     assert len(context_events) == 1
     assert "La versión buena" in context_events[0]["details_json"]
-    assert "Buenísimo, gracias" in fake_slack.post_calls[1]["text"]
+    assert "Petición actualizada:" in fake_slack.post_calls[1]["text"]
+    assert "Buenísimo, gracias. Lo sumo al pedido." in fake_slack.post_calls[1]["text"]
 
 
 def test_duplicate_thread_context_does_not_send_confirmation(tmp_path):
@@ -774,6 +858,7 @@ def test_audio_in_existing_thread_adds_context_without_duplicate(tmp_path):
 
     assert count_tasks(app.config.db_path) == 1
     assert len(fake_model.calls) == 1
+    assert "Petición actualizada:" in fake_slack.post_calls[1]["text"]
     assert "transcribí el audio" in fake_slack.post_calls[1]["text"]
     audio_row = get_audio_rows(app.config.db_path)[0]
     assert audio_row["task_id"] == 1

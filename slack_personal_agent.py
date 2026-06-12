@@ -235,6 +235,10 @@ def compact_text(value: Any, max_length: int = 140) -> str:
     return text[: max_length - 3].rstrip() + "..."
 
 
+def clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
 def parse_snooze_until(value: str, now: Optional[datetime] = None) -> Optional[datetime]:
     raw = normalize_for_matching(value)
     current = now or datetime.now(timezone.utc)
@@ -584,6 +588,7 @@ class AgentApp:
                     conversation_label TEXT,
                     summary TEXT,
                     requested_action TEXT,
+                    has_audio_transcript INTEGER NOT NULL DEFAULT 0,
                     priority TEXT,
                     category TEXT,
                     status TEXT DEFAULT 'new',
@@ -669,6 +674,8 @@ class AgentApp:
             self._ensure_column(conn, "tasks", "context_ack_error", "context_ack_error TEXT")
             self._ensure_column(conn, "tasks", "telegram_notified_at", "telegram_notified_at TEXT")
             self._ensure_column(conn, "tasks", "telegram_error", "telegram_error TEXT")
+            self._ensure_column(conn, "tasks", "public_request_text", "public_request_text TEXT")
+            self._ensure_column(conn, "tasks", "has_audio_transcript", "has_audio_transcript INTEGER NOT NULL DEFAULT 0")
 
             conn.execute(
                 """
@@ -696,6 +703,20 @@ class AgentApp:
                 UPDATE tasks
                 SET requester_label = sender_label
                 WHERE requester_label IS NULL OR requester_label = ''
+                """
+            )
+            conn.execute(
+                """
+                UPDATE tasks
+                SET public_request_text = COALESCE(public_request_text, summary)
+                WHERE public_request_text IS NULL OR public_request_text = ''
+                """
+            )
+            conn.execute(
+                """
+                UPDATE tasks
+                SET has_audio_transcript = COALESCE(has_audio_transcript, 0)
+                WHERE has_audio_transcript IS NULL
                 """
             )
             conn.execute(
@@ -1345,6 +1366,7 @@ Reglas:
         sender_label: str,
         conversation_label: str,
         classification: SlackClassification,
+        has_audio_transcript: bool = False,
     ) -> bool:
         timestamp = now_iso()
         with self.db_connect() as conn:
@@ -1363,14 +1385,16 @@ Reglas:
                     requester_label,
                     conversation_label,
                     summary,
+                    public_request_text,
                     requested_action,
+                    has_audio_transcript,
                     priority,
                     category,
                     status,
                     trello_status,
                     classification_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     timestamp,
@@ -1385,7 +1409,20 @@ Reglas:
                     sender_label,
                     conversation_label,
                     classification.summary,
+                    self.build_public_request_text(
+                        task_row={
+                            "classification_json": json.dumps(classification.model_dump(), ensure_ascii=False),
+                            "sender_label": sender_label,
+                            "requester_label": sender_label,
+                            "raw_text": classification.requested_action,
+                            "context_text": "",
+                            "requested_action": classification.requested_action,
+                        },
+                        transcribed_audio=False,
+                        context_text="",
+                    ),
                     classification.requested_action,
+                    int(has_audio_transcript),
                     classification.priority,
                     classification.category,
                     "new",
@@ -1464,6 +1501,63 @@ Reglas:
 
         return True
 
+    def _strip_public_request_prefix(self, text: str, *, sender_label: str = "", requester_label: str = "") -> str:
+        value = clean_text(text)
+        if not value:
+            return ""
+
+        for prefix in ("Petición registrada:", "Petición actualizada:", "Texto original:", "Audios transcriptos:"):
+            if value.startswith(prefix):
+                value = value[len(prefix):].strip()
+
+        value = re.sub(r"^(?:[A-ZÁÉÍÓÚÑ][^:\n]{0,80}?\s+)?(?:pide|solicita|requiere|necesita|quiere|consulta|pregunta|pide a Ivan Rodríguez que)\s+", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"^(?:a Ivan Rodríguez que|a Ivan que|que)\s+", "", value, flags=re.IGNORECASE)
+
+        if sender_label:
+            value = re.sub(rf"^{re.escape(sender_label)}\s*[:,-]?\s*", "", value, flags=re.IGNORECASE)
+        if requester_label and requester_label != sender_label:
+            value = re.sub(rf"^{re.escape(requester_label)}\s*[:,-]?\s*", "", value, flags=re.IGNORECASE)
+
+        return clean_text(value)
+
+    def build_public_request_text(
+        self,
+        *,
+        task_row: sqlite3.Row,
+        transcribed_audio: bool = False,
+        context_text: str = "",
+    ) -> str:
+        classification = {}
+        try:
+            classification = json.loads(task_row["classification_json"] or "{}")
+        except json.JSONDecodeError:
+            classification = {}
+
+        sender_label = task_row["sender_label"] or ""
+        requester_label = task_row["requester_label"] or sender_label
+        raw_text = task_row["raw_text"] or ""
+        context_source = context_text or task_row["context_text"] or ""
+        requested_action = clean_text(classification.get("requested_action") or task_row["requested_action"] or "")
+        base_text = requested_action or raw_text
+        base_text = self._strip_public_request_prefix(
+            base_text,
+            sender_label=sender_label,
+            requester_label=requester_label,
+        )
+        if not base_text:
+            base_text = self._strip_public_request_prefix(
+                raw_text,
+                sender_label=sender_label,
+                requester_label=requester_label,
+            )
+
+        pieces = [piece for piece in (base_text, context_source.strip()) if piece]
+        public_text = "\n".join(pieces).strip()
+        if not public_text:
+            public_text = "Pedido recibido."
+
+        return public_text
+
     def mark_task_acknowledged(self, task_id: int) -> None:
         with self.db_connect() as conn:
             conn.execute(
@@ -1527,10 +1621,15 @@ Reglas:
         requester_user_id = task_row["requester_user_id"] or task_row["user_id"] or ""
         if self.requester_needs_mention(task_row) and requester_user_id:
             mention = f"<@{requester_user_id}> "
+        request_text = task_row["public_request_text"] or self.build_public_request_text(task_row=task_row)
+        audio_prefix = (
+            "Transcribí el audio y lo dejé registrado para revisarlo. "
+            if int(task_row["has_audio_transcript"] or 0)
+            else "Lo dejé registrado para revisarlo. "
+        )
         text = (
-            f"{mention}Dale, lo tomo. Lo registré como: "
-            f"‘{compact_text(task_row['summary'] or 'el pedido', 180)}’. "
-            "Si querés, podés agregar contexto en este mismo hilo."
+            f"{mention}Dale, lo tomo. {audio_prefix}Si querés, podés agregar contexto en este mismo hilo.\n\n"
+            f"Petición registrada:\n{request_text}"
         )
         try:
             self.slack_call(
@@ -1554,12 +1653,13 @@ Reglas:
         if not task_row:
             return False
 
-        prefix = (
-            "Buenísimo, transcribí el audio y lo sumo al pedido. "
-            if transcribed_audio
-            else "Buenísimo, gracias. Lo sumo al pedido. "
+        request_text = task_row["public_request_text"] or self.build_public_request_text(
+            task_row=task_row,
+            transcribed_audio=transcribed_audio,
+            context_text=summary,
         )
-        text = prefix + f"El registro queda como: ‘{compact_text(summary or 'el pedido', 180)}’."
+        prefix = "Buenísimo, transcribí el audio y lo sumo al pedido." if transcribed_audio else "Buenísimo, gracias. Lo sumo al pedido."
+        text = f"{prefix}\n\nPetición actualizada:\n{request_text}"
         try:
             self.slack_call(
                 self.slack.chat_postMessage,
@@ -1657,11 +1757,20 @@ Reglas:
                 """
                 UPDATE tasks
                 SET updated_at = ?,
+                    public_request_text = ?,
                     status = CASE WHEN status = 'snoozed' THEN 'new' ELSE status END,
                     snoozed_until = CASE WHEN status = 'snoozed' THEN NULL ELSE snoozed_until END
                 WHERE id = ?
                 """,
-                (now_iso(), task_row["id"]),
+                (
+                    now_iso(),
+                    self.build_public_request_text(
+                        task_row=task_row,
+                        transcribed_audio=bool(message.get("_audio_transcript_added")),
+                        context_text=text,
+                    ),
+                    task_row["id"],
+                ),
             )
 
         self.record_task_event(
@@ -2787,6 +2896,7 @@ Reglas:
                 sender_label=state["sender_label"],
                 conversation_label=state["conversation_label"],
                 classification=classification,
+                has_audio_transcript=bool(message.get("_audio_transcript_added")),
             )
             if inserted:
                 task_row = self.get_task_row(conversation["id"], message["ts"])
@@ -2928,6 +3038,7 @@ Reglas:
                         sender_label=row["sender_label"] or "unknown",
                         conversation_label=row["conversation_label"] or row["channel_id"],
                         classification=classification,
+                        has_audio_transcript=False,
                     )
                     if inserted:
                         task_row = self.get_task_row(row["channel_id"], row["message_ts"])
