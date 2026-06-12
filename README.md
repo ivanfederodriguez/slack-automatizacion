@@ -138,6 +138,37 @@ Cuando una card pasa a una lista configurada como hecha (`TRELLO_DONE_LIST_ID` o
 /nosend TASK_ID
 ```
 
+## Configurar Telegram
+
+Para habilitar la aprobacion privada por Telegram:
+
+1. Crear un bot con `@BotFather` y guardar el token en `TELEGRAM_BOT_TOKEN`.
+2. Abrir un chat con ese bot y mandarle al menos un mensaje manual.
+3. Obtener el `chat_id` y cargarlo en `TELEGRAM_CHAT_ID`.
+4. Activar `TELEGRAM_ENABLED=true`.
+
+Una forma simple de obtener `TELEGRAM_CHAT_ID` es abrir esta URL despues de haberle escrito al bot:
+
+```text
+https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getUpdates
+```
+
+En la respuesta JSON aparece `message.chat.id`. Ese valor es el que va en `TELEGRAM_CHAT_ID`.
+
+Si usas un chat 1:1 con el bot, el `chat_id` suele ser un entero positivo. Si usas un grupo privado, puede venir como entero negativo. En ambos casos funciona mientras coincida con el chat donde Ivan va a aprobar.
+
+## Comandos operativos
+
+`python main.py trello-done-sync --limit 50`
+
+Chequea cards ya creadas en Trello y, si alguna paso a una lista marcada como hecha, mueve la tarea a `done_pending_reply` y dispara la notificacion de Telegram. Sirve para probar el flujo manualmente o para resincronizar si el loop no estuvo corriendo.
+
+`python main.py telegram-poll --limit 20`
+
+Lee comandos pendientes del bot de Telegram y procesa `/send`, `/edit` y `/nosend`. Es util para probar aprobaciones manualmente o para destrabar mensajes si queres correr Telegram por separado.
+
+Las respuestas finales no se envian automaticamente. El agente solo manda el mensaje final a Slack cuando Ivan usa `/send TASK_ID` o cuando se dispara un envio manual explicito por el flujo seguro existente.
+
 ## Primer arranque
 
 1. Verifica credenciales y modelo:
