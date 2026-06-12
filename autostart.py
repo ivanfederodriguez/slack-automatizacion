@@ -27,7 +27,7 @@ def ensure_executable(path: Path) -> None:
 
 
 def build_launch_artifacts(project_dir: Path) -> LaunchArtifacts:
-    support_dir = project_dir / "runtime"
+    support_dir = Path.home() / "Library" / "Application Support" / "slack-personal-agent" / "runtime"
     launch_dir = Path.home() / "Library" / "LaunchAgents"
     log_dir = support_dir / "logs"
     support_dir.mkdir(parents=True, exist_ok=True)
@@ -59,10 +59,7 @@ set -euo pipefail
 cd {shell_quote(str(project_dir))}
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
-for attempt in {{1..60}}; do
-  if curl -sf {shell_quote(ollama_base_url.rstrip('/'))}/api/tags >/dev/null 2>&1; then
-    break
-  fi
+until curl -sf {shell_quote(ollama_base_url.rstrip('/'))}/api/tags >/dev/null 2>&1; do
   sleep 2
 done
 
@@ -107,6 +104,7 @@ def install_launch_agents(project_dir: Path, ollama_base_url: str) -> LaunchArti
         raise RuntimeError("No encontré la Python de la .venv del proyecto.")
 
     artifacts = build_launch_artifacts(project_dir)
+    launch_working_directory = Path.home()
 
     artifacts.ollama_script.write_text(build_ollama_script(project_dir, ollama_path), encoding="utf-8")
     artifacts.agent_script.write_text(build_agent_script(project_dir, python_path, ollama_base_url), encoding="utf-8")
@@ -115,22 +113,18 @@ def install_launch_agents(project_dir: Path, ollama_base_url: str) -> LaunchArti
 
     ollama_plist = write_launchd_plist(
         label=OLLAMA_LABEL,
-        program_arguments=[
-            "/bin/zsh",
-            "-lc",
-            f"curl -sf {ollama_base_url.rstrip('/')}/api/tags >/dev/null 2>&1 || exec {shell_quote(ollama_path)} serve",
-        ],
+        program_arguments=["/bin/zsh", str(artifacts.ollama_script)],
         stdout_path=artifacts.log_dir / "ollama.stdout.log",
         stderr_path=artifacts.log_dir / "ollama.stderr.log",
-        working_directory=project_dir,
-        keep_alive=False,
+        working_directory=launch_working_directory,
+        keep_alive=True,
     )
     agent_plist = write_launchd_plist(
         label=AGENT_LABEL,
-        program_arguments=[python_path, str(project_dir / "main.py"), "poll"],
+        program_arguments=["/bin/zsh", str(artifacts.agent_script)],
         stdout_path=artifacts.log_dir / "agent.stdout.log",
         stderr_path=artifacts.log_dir / "agent.stderr.log",
-        working_directory=project_dir,
+        working_directory=launch_working_directory,
         keep_alive=True,
     )
 
@@ -138,8 +132,9 @@ def install_launch_agents(project_dir: Path, ollama_base_url: str) -> LaunchArti
     artifacts.agent_plist.write_bytes(plistlib.dumps(agent_plist))
 
     uid = os.getuid()
-    for plist in (artifacts.ollama_plist, artifacts.agent_plist):
+    for plist in (artifacts.agent_plist, artifacts.ollama_plist):
         subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(plist)], check=False)
+    for plist in (artifacts.ollama_plist, artifacts.agent_plist):
         subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)], check=True)
 
     return artifacts

@@ -3,10 +3,7 @@ set -euo pipefail
 cd '/Users/ivanrodriguez/Documents/Automatizaciones/slack-personal-agent'
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
-for attempt in {1..60}; do
-  if curl -sf 'http://127.0.0.1:11434'/api/tags >/dev/null 2>&1; then
-    break
-  fi
+until curl -sf 'http://127.0.0.1:11434'/api/tags >/dev/null 2>&1; do
   sleep 2
 done
 
