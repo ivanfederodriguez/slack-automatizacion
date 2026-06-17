@@ -1,5 +1,7 @@
+import json
 import sqlite3
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import slack_personal_agent
 from main import build_parser
@@ -377,6 +379,50 @@ def test_dm_actionable_creates_task(tmp_path):
     assert count_tasks(app.config.db_path) == 1
 
 
+def test_salesforce_report_request_overrides_research_classification(tmp_path):
+    message_text = (
+        "Ivo, me armás un informe de altas 2026 por campaña principal/campaña de origen:\n"
+        "<https://techo.lightning.force.com/lightning/r/Campaign/7011W000001buEh/view|[IND] Campañas Pauta Digital>\n"
+        "- amplify\n"
+        "- orgánico web"
+    )
+    fake_model = FakeStructuredModel(
+        [
+            make_classification(
+                summary="Micaela pide un informe de altas 2026.",
+                requested_action="Armar un informe de altas 2026 por campaña principal/campaña de origen.",
+                category="research",
+                needs_external_system=False,
+                external_systems=[],
+            )
+        ]
+    )
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {"ts": "1.05", "text": message_text, "user": "UOTHER"},
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    task = get_task(app.config.db_path)
+    classification = json.loads(task["classification_json"])
+    assert count_tasks(app.config.db_path) == 1
+    assert task["category"] == "salesforce"
+    assert classification["category"] == "salesforce"
+    assert classification["needs_external_system"] is True
+    assert "salesforce" in classification["external_systems"]
+    assert "Campañas/fuentes solicitadas:" in task["public_request_text"]
+    assert "- [IND] Campañas Pauta Digital" in task["public_request_text"]
+    assert "  - amplify" in task["public_request_text"]
+
+
 def test_actionable_task_can_auto_sync_to_trello(tmp_path):
     fake_model = FakeStructuredModel([sample_classification()])
     fake_trello = FakeTrelloClient()
@@ -430,9 +476,12 @@ def test_new_dm_task_sends_automatic_ack_without_mention(tmp_path):
     assert task["acknowledged_at"]
     assert fake_slack.post_calls[0]["channel"] == "D123"
     assert fake_slack.post_calls[0]["thread_ts"] == "1.2"
-    assert "Petición registrada:" in fake_slack.post_calls[0]["text"]
-    assert "Lo dejé registrado para revisarlo" in fake_slack.post_calls[0]["text"]
-    assert "<@UOTHER>" not in fake_slack.post_calls[0]["text"]
+    text = fake_slack.post_calls[0]["text"]
+    assert "\n\n*Pedido registrado:*" in text
+    assert "*Sistema:* Salesforce" in text
+    assert "*Estado:* Pendiente de revisión" in text
+    assert "Lo dejé registrado para revisarlo" in text
+    assert "<@UOTHER>" not in text
 
 
 def test_new_private_channel_task_ack_mentions_requester(tmp_path):
@@ -453,7 +502,7 @@ def test_new_private_channel_task_ack_mentions_requester(tmp_path):
     )
 
     assert fake_slack.post_calls[0]["text"].startswith("<@UOTHER> Dale, lo tomo.")
-    assert "Petición registrada:" in fake_slack.post_calls[0]["text"]
+    assert "*Pedido registrado:*" in fake_slack.post_calls[0]["text"]
 
 
 def test_new_group_dm_task_ack_mentions_requester(tmp_path):
@@ -474,7 +523,7 @@ def test_new_group_dm_task_ack_mentions_requester(tmp_path):
     )
 
     assert fake_slack.post_calls[0]["text"].startswith("<@UOTHER> Dale, lo tomo.")
-    assert "Petición registrada:" in fake_slack.post_calls[0]["text"]
+    assert "*Pedido registrado:*" in fake_slack.post_calls[0]["text"]
 
 
 def test_send_task_acknowledgement_uses_public_request_text_without_truncation(tmp_path):
@@ -509,7 +558,7 @@ def test_send_task_acknowledgement_uses_public_request_text_without_truncation(t
     app.send_task_acknowledgement(1)
 
     text = fake_slack.post_calls[0]["text"]
-    assert "Petición registrada:" in text
+    assert "*Pedido registrado:*" in text
     assert long_request in text
     assert "Luciana Santos pide a Ivan Rodríguez" not in text
     assert "..." not in text
@@ -601,7 +650,7 @@ def test_thread_context_updates_existing_task_without_duplicate_and_confirms(tmp
     assert len(fake_model.calls) == 1
     assert processed_context["classification_status"] == "context_added"
     assert task["last_context_ack_at"]
-    assert "Petición actualizada:" in fake_slack.post_calls[1]["text"]
+    assert "*Pedido actualizado:*" in fake_slack.post_calls[1]["text"]
     assert "Buenísimo, gracias. Lo sumo al pedido." in fake_slack.post_calls[1]["text"]
     assert len(context_events) == 1
     assert fake_trello.comments[0]["card_id"] == "card123"
@@ -645,8 +694,57 @@ def test_consecutive_dm_messages_from_same_sender_group_into_one_task(tmp_path):
     assert second_message["classification_status"] == "context_added"
     assert len(context_events) == 1
     assert "La versión buena" in context_events[0]["details_json"]
-    assert "Petición actualizada:" in fake_slack.post_calls[1]["text"]
+    assert "*Pedido actualizado:*" in fake_slack.post_calls[1]["text"]
     assert "Buenísimo, gracias. Lo sumo al pedido." in fake_slack.post_calls[1]["text"]
+
+
+def test_recent_context_excludes_previous_day_without_thread(tmp_path):
+    zone = ZoneInfo("America/Argentina/Cordoba")
+    current_ts = f"{datetime(2026, 6, 17, 0, 30, tzinfo=zone).timestamp():.6f}"
+    yesterday_ts = f"{datetime(2026, 6, 16, 23, 45, tzinfo=zone).timestamp():.6f}"
+    fake_slack = FakeSlackClient()
+    fake_slack.history_messages = [
+        {"ts": yesterday_ts, "text": "Ayer era otro pedido.", "user": "UOTHER"},
+    ]
+    app = AgentApp(
+        make_config(
+            tmp_path,
+            CONTEXT_MAX_AGE_MINUTES="120",
+            LOCAL_TIMEZONE="America/Argentina/Cordoba",
+        ),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        sleep_fn=lambda _: None,
+    )
+
+    context = app.fetch_recent_context("D123", current_ts)
+
+    assert "Ayer era otro pedido" not in context
+    assert context == ""
+
+
+def test_recent_context_includes_same_day_message_within_window(tmp_path):
+    zone = ZoneInfo("America/Argentina/Cordoba")
+    current_ts = f"{datetime(2026, 6, 17, 10, 0, tzinfo=zone).timestamp():.6f}"
+    previous_ts = f"{datetime(2026, 6, 17, 9, 30, tzinfo=zone).timestamp():.6f}"
+    fake_slack = FakeSlackClient()
+    fake_slack.history_messages = [
+        {"ts": previous_ts, "text": "Usá también el reporte de mayo.", "user": "UOTHER"},
+    ]
+    app = AgentApp(
+        make_config(
+            tmp_path,
+            CONTEXT_MAX_AGE_MINUTES="120",
+            LOCAL_TIMEZONE="America/Argentina/Cordoba",
+        ),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        sleep_fn=lambda _: None,
+    )
+
+    context = app.fetch_recent_context("D123", current_ts)
+
+    assert "Ana Gomez: Usá también el reporte de mayo." in context
 
 
 def test_duplicate_thread_context_does_not_send_confirmation(tmp_path):
@@ -919,7 +1017,7 @@ def test_audio_in_existing_thread_adds_context_without_duplicate(tmp_path):
 
     assert count_tasks(app.config.db_path) == 1
     assert len(fake_model.calls) == 1
-    assert "Petición actualizada:" in fake_slack.post_calls[1]["text"]
+    assert "*Pedido actualizado:*" in fake_slack.post_calls[1]["text"]
     assert "transcribí el audio" in fake_slack.post_calls[1]["text"]
     audio_row = get_audio_rows(app.config.db_path)[0]
     assert audio_row["task_id"] == 1
@@ -1799,7 +1897,7 @@ def test_waiting_requester_reply_clears_waiting_and_adds_context(tmp_path):
     assert task["waiting_cleared_at"]
     assert any("Respuesta recibida desde Slack: Este es el link" in comment["text"] for comment in fake_trello.comments)
     assert len(get_task_events(app.config.db_path, "waiting_cleared")) == 1
-    assert "Petición actualizada:" in fake_slack.post_calls[-1]["text"]
+    assert "*Pedido actualizado:*" in fake_slack.post_calls[-1]["text"]
 
 
 def test_trello_done_ignores_waiting_task_even_when_due_complete(tmp_path):
@@ -1896,7 +1994,7 @@ def test_trello_done_slack_auto_sends_final_reply_without_telegram(tmp_path):
     assert task["status"] == "responded"
     assert task["reply_ts"] == "50.123456"
     assert "Listo, ya quedó resuelto." in text
-    assert "Petición resuelta:" in text
+    assert "*Pedido resuelto:*" in text
     assert public_request in text
     assert "Luciana Santos pide a Ivan Rodríguez" not in text
     assert "..." not in text
@@ -3239,6 +3337,21 @@ def test_extract_urls_from_text_deduplicates_and_cleans_slack_links():
         "https://example.com/reporte",
         "https://github.com/acme/platform/issues/42",
     ]
+
+
+def test_extract_salesforce_url_from_slack_link_drops_visible_text():
+    text = (
+        "<https://techo.lightning.force.com/lightning/r/Campaign/7011W000001buEh/view|"
+        "[IND] Campañas Pauta Digital>"
+    )
+
+    urls = extract_urls_from_text(text)
+
+    assert urls == [
+        "https://techo.lightning.force.com/lightning/r/Campaign/7011W000001buEh/view",
+    ]
+    assert "Connect your Salesforce account" not in urls[0]
+    assert "[IND] Campañas Pauta Digital" not in urls[0]
 
 
 def test_prompt_includes_public_url_enrichment(tmp_path):

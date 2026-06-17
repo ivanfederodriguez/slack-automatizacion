@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Protocol, TypedDict
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
@@ -52,6 +53,8 @@ DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 MAX_MESSAGE_LINKS = 5
 MAX_PUBLIC_PREVIEW_BYTES = 65536
 MAX_SLACK_MESSAGE_LENGTH = 40000
+DEFAULT_CONTEXT_MAX_AGE_MINUTES = 120
+DEFAULT_LOCAL_TIMEZONE = "America/Argentina/Cordoba"
 VISUAL_IMAGE_SUFFIXES = {
     "gif",
     "heic",
@@ -245,6 +248,13 @@ def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
     return parsed
 
 
+def parse_slack_timestamp(value: Any) -> Optional[datetime]:
+    try:
+        return datetime.fromtimestamp(float(value), timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
 def now_slack_ts() -> str:
     return f"{time.time():.6f}"
 
@@ -270,6 +280,14 @@ def compact_text(value: Any, max_length: int = 140) -> str:
 
 def clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def row_value(row: Any, key: str, default: Any = "") -> Any:
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
 
 
 def parse_snooze_until(value: str, now: Optional[datetime] = None) -> Optional[datetime]:
@@ -308,6 +326,8 @@ class AgentConfig:
     slack_sleep_seconds: float = 1.2
     include_self_for_test: bool = False
     case_grouping_window_minutes: int = 15
+    context_max_age_minutes: int = DEFAULT_CONTEXT_MAX_AGE_MINUTES
+    local_timezone: str = DEFAULT_LOCAL_TIMEZONE
     model_provider: Literal["ollama", "groq"] = DEFAULT_PROVIDER
     ollama_model: str = DEFAULT_OLLAMA_MODEL
     ollama_base_url: str = DEFAULT_OLLAMA_BASE_URL
@@ -390,6 +410,11 @@ class AgentConfig:
         case_grouping_window_minutes_raw = (
             get("CASE_GROUPING_WINDOW_MINUTES", "15") or "15"
         ).strip()
+        context_max_age_minutes_raw = (
+            get("CONTEXT_MAX_AGE_MINUTES", str(DEFAULT_CONTEXT_MAX_AGE_MINUTES))
+            or str(DEFAULT_CONTEXT_MAX_AGE_MINUTES)
+        ).strip()
+        local_timezone = (get("LOCAL_TIMEZONE", DEFAULT_LOCAL_TIMEZONE) or DEFAULT_LOCAL_TIMEZONE).strip()
         sync_worker_seconds_raw = (get("SYNC_WORKER_SECONDS", "60") or "60").strip()
 
         try:
@@ -408,6 +433,18 @@ class AgentConfig:
             raise ConfigError("CASE_GROUPING_WINDOW_MINUTES debe ser un entero.") from exc
         if case_grouping_window_minutes < 0:
             raise ConfigError("CASE_GROUPING_WINDOW_MINUTES debe ser mayor o igual a 0.")
+
+        try:
+            context_max_age_minutes = int(context_max_age_minutes_raw)
+        except ValueError as exc:
+            raise ConfigError("CONTEXT_MAX_AGE_MINUTES debe ser un entero.") from exc
+        if context_max_age_minutes < 0:
+            raise ConfigError("CONTEXT_MAX_AGE_MINUTES debe ser mayor o igual a 0.")
+
+        try:
+            ZoneInfo(local_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ConfigError("LOCAL_TIMEZONE debe ser una timezone IANA válida.") from exc
 
         try:
             sync_worker_seconds = int(sync_worker_seconds_raw)
@@ -465,6 +502,8 @@ class AgentConfig:
             slack_sleep_seconds=slack_sleep_seconds,
             include_self_for_test=parse_bool(get("INCLUDE_SELF_FOR_TEST", "false") or "false"),
             case_grouping_window_minutes=case_grouping_window_minutes,
+            context_max_age_minutes=context_max_age_minutes,
+            local_timezone=local_timezone,
             model_provider=model_provider,  # type: ignore[arg-type]
             ollama_model=(get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL) or DEFAULT_OLLAMA_MODEL).strip(),
             ollama_base_url=(get("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL) or DEFAULT_OLLAMA_BASE_URL).strip(),
@@ -566,6 +605,93 @@ def normalize_for_matching(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text)
     without_accents = "".join(char for char in normalized if not unicodedata.combining(char))
     return without_accents.lower().strip()
+
+
+SALESFORCE_SYSTEM_TERMS = ("salesforce", "crm")
+SALESFORCE_OPERATION_TERMS = (
+    "informe",
+    "reporte",
+    "report",
+    "dashboard",
+    "tablero",
+    "altas",
+    "campana",
+    "campana principal",
+    "campana de origen",
+    "armar",
+    "generar",
+    "exportar",
+    "consultar",
+    "revisar",
+)
+
+
+def has_salesforce_url(message_links: list[MessageLink]) -> bool:
+    return any(link.url_type == "salesforce" for link in message_links)
+
+
+def has_salesforce_text_signal(text: str) -> bool:
+    normalized = normalize_for_matching(text)
+    if not normalized:
+        return False
+    has_system = any(term in normalized for term in SALESFORCE_SYSTEM_TERMS)
+    has_operation = any(term in normalized for term in SALESFORCE_OPERATION_TERMS)
+    return has_system and has_operation
+
+
+def improve_salesforce_requested_action(action: str, text: str) -> str:
+    cleaned = clean_text(action)
+    if not cleaned:
+        return cleaned
+
+    normalized_action = normalize_for_matching(cleaned)
+    normalized_text = normalize_for_matching(text)
+    if "salesforce" not in normalized_action and (
+        "campana" in normalized_action
+        or "campana" in normalized_text
+        or "reporte" in normalized_action
+        or "informe" in normalized_action
+    ):
+        cleaned = cleaned.rstrip(".")
+        cleaned = f"{cleaned} en Salesforce."
+
+    if (
+        "datos personales" in normalized_text
+        and "donacion" in normalized_text
+        and "datos personales" not in normalize_for_matching(cleaned)
+        and "donacion" not in normalize_for_matching(cleaned)
+    ):
+        cleaned = cleaned.rstrip(".")
+        cleaned = f"{cleaned}, incluyendo datos personales y de donación."
+
+    return cleaned
+
+
+def normalize_classification_with_rules(
+    classification: SlackClassification,
+    *,
+    text: str,
+    message_links: list[MessageLink],
+) -> SlackClassification:
+    """Apply deterministic business rules that should outrank the local model."""
+    if not has_salesforce_url(message_links) and not has_salesforce_text_signal(text):
+        return classification
+
+    external_systems = coerce_string_list(classification.external_systems)
+    if "salesforce" not in {normalize_for_matching(system) for system in external_systems}:
+        external_systems.append("salesforce")
+
+    return classification.model_copy(
+        update={
+            "category": "salesforce",
+            "needs_external_system": True,
+            "external_systems": external_systems,
+            "requested_action": improve_salesforce_requested_action(
+                classification.requested_action,
+                text,
+            ),
+        }
+    )
 
 
 def validate_trello_api_key_format(value: str) -> Optional[str]:
@@ -1885,6 +2011,7 @@ Reglas:
         sender_label: str,
         conversation_label: str,
         classification: SlackClassification,
+        raw_text: str = "",
         has_audio_transcript: bool = False,
     ) -> bool:
         timestamp = now_iso()
@@ -1933,7 +2060,7 @@ Reglas:
                             "classification_json": json.dumps(classification.model_dump(), ensure_ascii=False),
                             "sender_label": sender_label,
                             "requester_label": sender_label,
-                            "raw_text": classification.requested_action,
+                            "raw_text": raw_text or classification.requested_action,
                             "context_text": "",
                             "requested_action": classification.requested_action,
                         },
@@ -2025,7 +2152,16 @@ Reglas:
         if not value:
             return ""
 
-        for prefix in ("Petición registrada:", "Petición actualizada:", "Texto original:", "Audios transcriptos:"):
+        for prefix in (
+            "Petición registrada:",
+            "Petición actualizada:",
+            "Petición resuelta:",
+            "*Pedido registrado:*",
+            "*Pedido actualizado:*",
+            "*Pedido resuelto:*",
+            "Texto original:",
+            "Audios transcriptos:",
+        ):
             if value.startswith(prefix):
                 value = value[len(prefix):].strip()
 
@@ -2039,6 +2175,177 @@ Reglas:
 
         return clean_text(value)
 
+    def classification_from_task_row(self, task_row: Any) -> dict[str, Any]:
+        try:
+            return json.loads(row_value(task_row, "classification_json", "") or "{}")
+        except json.JSONDecodeError:
+            return {}
+
+    def classification_external_systems(self, classification: dict[str, Any]) -> list[str]:
+        systems = coerce_string_list(classification.get("external_systems"))
+        category = normalize_for_matching(classification.get("category") or "")
+        if category == "salesforce" and "salesforce" not in {normalize_for_matching(system) for system in systems}:
+            systems.append("salesforce")
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for system in systems:
+            normalized = normalize_for_matching(system)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                deduped.append(normalized)
+        return deduped
+
+    def format_external_systems_for_slack(self, classification: dict[str, Any]) -> str:
+        labels = {
+            "salesforce": "Salesforce",
+            "trello": "Trello",
+            "github": "GitHub",
+            "google_sheet": "Google Sheets",
+            "google_sheets": "Google Sheets",
+            "google_drive": "Google Drive",
+            "google_doc": "Google Docs",
+            "google_docs": "Google Docs",
+        }
+        systems = self.classification_external_systems(classification)
+        return ", ".join(labels.get(system, system.replace("_", " ").title()) for system in systems)
+
+    def is_salesforce_classification(self, classification: dict[str, Any]) -> bool:
+        return (
+            normalize_for_matching(classification.get("category") or "") == "salesforce"
+            or "salesforce" in self.classification_external_systems(classification)
+        )
+
+    def strip_slack_link_markup(self, text: str) -> str:
+        return re.sub(
+            r"<(https?://[^>|]+)(?:\|([^>]+))?>",
+            lambda match: clean_text(match.group(2) or match.group(1)),
+            text,
+        )
+
+    def extract_salesforce_campaign_sections(self, text: str) -> list[tuple[str, list[str]]]:
+        sections: list[tuple[str, list[str]]] = []
+        current_index: Optional[int] = None
+        link_pattern = re.compile(r"<(https?://[^>|]+)(?:\|([^>]+))?>")
+        ignored_labels = {"connect your salesforce account"}
+
+        for line in str(text or "").splitlines():
+            matches = list(link_pattern.finditer(line))
+            salesforce_matches = [
+                match
+                for match in matches
+                if classify_url(match.group(1))[0] == "salesforce"
+            ]
+            if salesforce_matches:
+                for match in salesforce_matches:
+                    label = clean_text(match.group(2) or match.group(1))
+                    if normalize_for_matching(label) in ignored_labels:
+                        label = clean_text(match.group(1))
+                    sections.append((label, []))
+                    current_index = len(sections) - 1
+                continue
+
+            bullet_match = re.match(r"^\s*[-*•]\s+(.+?)\s*$", line)
+            if bullet_match and current_index is not None:
+                label, items = sections[current_index]
+                item = self.strip_slack_link_markup(bullet_match.group(1)).strip()
+                if item:
+                    items.append(item)
+                    sections[current_index] = (label, items)
+                continue
+
+            if line.strip():
+                current_index = None
+
+        deduped: list[tuple[str, list[str]]] = []
+        seen: set[str] = set()
+        for label, items in sections:
+            key = normalize_for_matching(label)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append((label, items))
+        return deduped
+
+    def salesforce_required_fields_text(self, source_text: str) -> str:
+        normalized = normalize_for_matching(source_text)
+        groups = [
+            (
+                "Persona",
+                [
+                    ("nombre y apellido", ("nombre y apellido", "nombre completo")),
+                    ("fecha de nacimiento o edad", ("fecha de nacimiento", "edad")),
+                    ("lugar de residencia", ("lugar de residencia", "residencia")),
+                    ("email", ("email", "correo")),
+                    ("telefono", ("telefono", "celular")),
+                    ("DNI", ("dni", "documento")),
+                ],
+                "datos personales solicitados",
+                ("datos personales", "datos de persona", "datos de la persona"),
+            ),
+            (
+                "Donación",
+                [
+                    ("fecha establecida", ("fecha establecida",)),
+                    ("estado", ("estado",)),
+                    ("monto", ("monto", "importe")),
+                    ("fecha de finalización", ("fecha de finalizacion", "fecha de finalización")),
+                    ("campaña", ("campana", "campaña")),
+                ],
+                "datos de donación solicitados",
+                ("datos de donacion", "datos de donación", "donacion", "donación"),
+            ),
+        ]
+
+        lines = []
+        for group_name, candidates, fallback, fallback_terms in groups:
+            fields = [
+                label
+                for label, terms in candidates
+                if any(normalize_for_matching(term) in normalized for term in terms)
+            ]
+            if fields:
+                lines.append(f"- {group_name}: {', '.join(fields)}.")
+            elif any(normalize_for_matching(term) in normalized for term in fallback_terms):
+                lines.append(f"- {group_name}: {fallback}.")
+        return "\n".join(lines)
+
+    def build_salesforce_public_request_text(
+        self,
+        *,
+        classification: dict[str, Any],
+        raw_text: str,
+        base_text: str,
+        context_text: str,
+    ) -> str:
+        source_text = "\n".join(piece for piece in (raw_text, base_text, context_text) if piece)
+        normalized_source = normalize_for_matching(source_text)
+        if not any(term in normalized_source for term in ("informe", "reporte", "report", "dashboard", "tablero", "altas", "campana")):
+            return ""
+
+        request_text = self.strip_slack_link_markup(base_text).strip()
+        request_text = re.sub(r"\s+", " ", request_text).strip()
+        if not request_text:
+            request_text = "Armar el informe solicitado en Salesforce."
+        if "salesforce" not in normalize_for_matching(request_text):
+            request_text = f"{request_text.rstrip('.')} en Salesforce."
+        else:
+            request_text = f"{request_text.rstrip('.')}."
+
+        blocks = [request_text]
+        campaign_sections = self.extract_salesforce_campaign_sections(raw_text)
+        if campaign_sections:
+            campaign_lines = ["Campañas/fuentes solicitadas:"]
+            for label, items in campaign_sections:
+                campaign_lines.append(f"- {label}")
+                campaign_lines.extend(f"  - {item}" for item in items)
+            blocks.append("\n".join(campaign_lines))
+
+        fields_text = self.salesforce_required_fields_text(source_text)
+        if fields_text:
+            blocks.append("\n".join(["Campos requeridos:", fields_text]))
+
+        return "\n\n".join(blocks).strip()
+
     def build_public_request_text(
         self,
         *,
@@ -2046,17 +2353,13 @@ Reglas:
         transcribed_audio: bool = False,
         context_text: str = "",
     ) -> str:
-        classification = {}
-        try:
-            classification = json.loads(task_row["classification_json"] or "{}")
-        except json.JSONDecodeError:
-            classification = {}
+        classification = self.classification_from_task_row(task_row)
 
-        sender_label = task_row["sender_label"] or ""
-        requester_label = task_row["requester_label"] or sender_label
-        raw_text = task_row["raw_text"] or ""
-        context_source = context_text or task_row["context_text"] or ""
-        requested_action = clean_text(classification.get("requested_action") or task_row["requested_action"] or "")
+        sender_label = row_value(task_row, "sender_label", "") or ""
+        requester_label = row_value(task_row, "requester_label", "") or sender_label
+        raw_text = row_value(task_row, "raw_text", "") or ""
+        context_source = context_text or row_value(task_row, "context_text", "") or ""
+        requested_action = clean_text(classification.get("requested_action") or row_value(task_row, "requested_action", "") or "")
         base_text = requested_action or raw_text
         base_text = self._strip_public_request_prefix(
             base_text,
@@ -2069,6 +2372,16 @@ Reglas:
                 sender_label=sender_label,
                 requester_label=requester_label,
             )
+
+        if self.is_salesforce_classification(classification):
+            salesforce_text = self.build_salesforce_public_request_text(
+                classification=classification,
+                raw_text=raw_text,
+                base_text=base_text,
+                context_text=context_source,
+            )
+            if salesforce_text:
+                return salesforce_text
 
         pieces = [piece for piece in (base_text, context_source.strip()) if piece]
         public_text = "\n".join(pieces).strip()
@@ -2142,14 +2455,23 @@ Reglas:
             mention = f"<@{requester_user_id}> "
         request_text = task_row["public_request_text"] or self.build_public_request_text(task_row=task_row)
         audio_prefix = (
-            "Transcribí el audio y lo dejé registrado para revisarlo. "
+            "Transcribí el audio y lo dejé registrado para revisarlo."
             if int(task_row["has_audio_transcript"] or 0)
-            else "Lo dejé registrado para revisarlo. "
+            else "Lo dejé registrado para revisarlo."
         )
-        text = (
-            f"{mention}Dale, lo tomo. {audio_prefix}Si querés, podés agregar contexto en este mismo hilo.\n\n"
-            f"Petición registrada:\n{request_text}"
-        )
+        classification = self.classification_from_task_row(task_row)
+        systems_text = self.format_external_systems_for_slack(classification)
+        missing_information = coerce_string_list(classification.get("missing_information"))
+        blocks = [
+            f"{mention}Dale, lo tomo. {audio_prefix}",
+            f"*Pedido registrado:*\n{request_text}",
+        ]
+        if systems_text:
+            blocks.append(f"*Sistema:* {systems_text}")
+        if missing_information:
+            blocks.append("*Falta información:*\n" + "\n".join(f"- {item}" for item in missing_information))
+        blocks.append("*Estado:* Pendiente de revisión")
+        text = "\n\n".join(blocks)
         try:
             self.slack_call(
                 self.slack.chat_postMessage,
@@ -2167,7 +2489,7 @@ Reglas:
         self.mark_task_acknowledged(task_id)
         return True
 
-    def send_context_acknowledgement(self, task_id: int, summary: str, *, transcribed_audio: bool = False) -> bool:
+    def send_context_acknowledgement(self, task_id: int, new_context_text: str, *, transcribed_audio: bool = False) -> bool:
         task_row = self.get_task_by_id(task_id)
         if not task_row:
             return False
@@ -2175,10 +2497,16 @@ Reglas:
         request_text = task_row["public_request_text"] or self.build_public_request_text(
             task_row=task_row,
             transcribed_audio=transcribed_audio,
-            context_text=summary,
+            context_text=new_context_text,
         )
         prefix = "Buenísimo, transcribí el audio y lo sumo al pedido." if transcribed_audio else "Buenísimo, gracias. Lo sumo al pedido."
-        text = f"{prefix}\n\nPetición actualizada:\n{request_text}"
+        blocks = [
+            prefix,
+            f"*Pedido actualizado:*\n{request_text}",
+        ]
+        if new_context_text.strip():
+            blocks.append(f"*Nuevo contexto agregado:*\n{new_context_text.strip()}")
+        text = "\n\n".join(blocks)
         try:
             self.slack_call(
                 self.slack.chat_postMessage,
@@ -2216,9 +2544,9 @@ Reglas:
         if self.requester_needs_mention(task_row) and requester_user_id:
             mention = f"<@{requester_user_id}> "
         return (
-            f"{mention}Para poder avanzar, necesito que me pases esto:\n\n"
-            f"{waiting_request_text}\n\n"
-            "Cuando me lo compartas por este hilo, lo sumo al pedido."
+            f"{mention}Para poder avanzar, necesito que me pases esto.\n\n"
+            f"*Falta información:*\n{waiting_request_text}\n\n"
+            "*Estado:* Esperando información"
         )
 
     def mark_task_waiting_requested(
@@ -2455,7 +2783,11 @@ Reglas:
         has_visual_context = bool(visual_attachments)
         context_text = ""
         try:
-            context_text = self.fetch_recent_context(conversation["id"], message["ts"])
+            context_text = self.fetch_recent_context(
+                conversation["id"],
+                message["ts"],
+                thread_ts=message.get("thread_ts"),
+            )
         except Exception:
             context_text = ""
 
@@ -2486,7 +2818,6 @@ Reglas:
             )
             return False
 
-        summary = task_row["summary"] or "el pedido"
         with self.db_connect() as conn:
             conn.execute(
                 """
@@ -2536,7 +2867,7 @@ Reglas:
         if text:
             self.send_context_acknowledgement(
                 task_row["id"],
-                summary,
+                text,
                 transcribed_audio=bool(message.get("_audio_transcript_added")),
             )
         if (
@@ -2752,7 +3083,7 @@ Reglas:
             ).fetchall()
         return list(rows)
 
-    def get_message_links_context(self, channel_id: str, message_ts: str) -> str:
+    def get_message_link_objects(self, channel_id: str, message_ts: str) -> list[MessageLink]:
         rows = self.get_message_links(channel_id, message_ts)
         links: list[MessageLink] = []
         for row in rows:
@@ -2775,6 +3106,10 @@ Reglas:
                     metadata=metadata,
                 )
             )
+        return links
+
+    def get_message_links_context(self, channel_id: str, message_ts: str) -> str:
+        links = self.get_message_link_objects(channel_id, message_ts)
         return format_links_for_prompt(links)
 
     def task_context_additions_text(self, task_id: int, limit: int = 8) -> str:
@@ -2844,6 +3179,43 @@ Reglas:
         first_name = requester_label.split()[0] if requester_label else ""
         return first_name or "Hola"
 
+    def local_zone(self) -> ZoneInfo:
+        return ZoneInfo(self.config.local_timezone)
+
+    def is_same_local_day(self, left: datetime, right: datetime) -> bool:
+        zone = self.local_zone()
+        return left.astimezone(zone).date() == right.astimezone(zone).date()
+
+    def is_message_within_context_window(self, current_ts: str, previous_ts: str) -> bool:
+        current_dt = parse_slack_timestamp(current_ts)
+        previous_dt = parse_slack_timestamp(previous_ts)
+        if not current_dt or not previous_dt:
+            return False
+
+        age_minutes = (current_dt - previous_dt).total_seconds() / 60
+        if age_minutes < 0:
+            return False
+        if self.config.context_max_age_minutes == 0:
+            return False
+        if age_minutes > self.config.context_max_age_minutes:
+            return False
+        return self.is_same_local_day(current_dt, previous_dt)
+
+    def is_message_within_grouping_window(self, current_ts: str, previous_ts: str) -> bool:
+        current_dt = parse_slack_timestamp(current_ts)
+        previous_dt = parse_slack_timestamp(previous_ts)
+        if not current_dt or not previous_dt:
+            return False
+
+        age_minutes = (current_dt - previous_dt).total_seconds() / 60
+        if age_minutes < 0:
+            return False
+        if self.config.case_grouping_window_minutes == 0:
+            return False
+        if age_minutes > self.config.case_grouping_window_minutes:
+            return False
+        return self.is_same_local_day(current_dt, previous_dt)
+
     def find_existing_case_for_message(
         self,
         message: dict[str, Any],
@@ -2908,7 +3280,14 @@ Reglas:
                     """,
                     (channel_id, *statuses, recent_cutoff, requester_user_id),
                 ).fetchone()
-                if recent_row and recent_row["message_ts"] != message.get("ts"):
+                if (
+                    recent_row
+                    and recent_row["message_ts"] != message.get("ts")
+                    and self.is_message_within_grouping_window(
+                        str(message.get("ts") or ""),
+                        str(recent_row["message_ts"] or ""),
+                    )
+                ):
                     return recent_row
 
             if not self.looks_like_context_message(message.get("text", "")):
@@ -2936,8 +3315,17 @@ Reglas:
                 (channel_id, *statuses, recent_cutoff, requester_user_id, sender_label),
             ).fetchall()
 
-        if len(recent_rows) == 1 and recent_rows[0]["message_ts"] != message.get("ts"):
-            return recent_rows[0]
+        eligible_rows = [
+            row
+            for row in recent_rows
+            if row["message_ts"] != message.get("ts")
+            and self.is_message_within_grouping_window(
+                str(message.get("ts") or ""),
+                str(row["message_ts"] or ""),
+            )
+        ]
+        if len(eligible_rows) == 1:
+            return eligible_rows[0]
         return None
 
     def looks_like_context_message(self, text: str) -> bool:
@@ -3019,7 +3407,7 @@ Reglas:
 
     def build_trello_card_payload(self, task_row: sqlite3.Row) -> tuple[str, str]:
         summary = task_row["summary"] or "Nueva tarea desde Slack"
-        action = task_row["requested_action"] or "Sin acción especificada"
+        action = task_row["public_request_text"] or task_row["requested_action"] or "Sin acción especificada"
         raw_text = task_row["raw_text"] or ""
         context_text = task_row["context_text"] or ""
         context_additions = self.task_context_additions_text(task_row["id"])
@@ -3447,7 +3835,13 @@ Reglas:
 
     def build_slack_auto_final_reply_text(self, task_row: sqlite3.Row) -> str:
         public_request_text = task_row["public_request_text"] or self.build_public_request_text(task_row=task_row)
-        return f"Listo, ya quedó resuelto.\n\nPetición resuelta:\n{public_request_text}"
+        return "\n\n".join(
+            [
+                "Listo, ya quedó resuelto.",
+                f"*Pedido resuelto:*\n{public_request_text}",
+                "*Estado:* Resuelto",
+            ]
+        )
 
     def send_slack_auto_final_reply(self, task_row: sqlite3.Row) -> bool:
         try:
@@ -3543,20 +3937,40 @@ Reglas:
 
         return conversations
 
-    def fetch_recent_context(self, channel_id: str, before_ts: str, limit: int = 6) -> str:
-        response = self.slack_call(
-            self.slack.conversations_history,
-            channel=channel_id,
-            latest=before_ts,
-            inclusive=False,
-            limit=limit,
-        )
+    def fetch_recent_context(
+        self,
+        channel_id: str,
+        before_ts: str,
+        limit: int = 6,
+        thread_ts: Optional[str] = None,
+    ) -> str:
+        explicit_thread = bool(thread_ts and thread_ts != before_ts)
+        if explicit_thread:
+            response = self.slack_call(
+                self.slack.conversations_replies,
+                channel=channel_id,
+                ts=thread_ts,
+                limit=limit + 1,
+            )
+        else:
+            response = self.slack_call(
+                self.slack.conversations_history,
+                channel=channel_id,
+                latest=before_ts,
+                inclusive=False,
+                limit=limit,
+            )
         messages = sorted(
             (message for message in response.get("messages", []) if self.is_human_message(message)),
             key=lambda message: float(message.get("ts", "0")),
         )
         lines = []
         for message in messages:
+            message_ts = str(message.get("ts") or "")
+            if not message_ts or float(message_ts) >= float(before_ts):
+                continue
+            if not explicit_thread and not self.is_message_within_context_window(before_ts, message_ts):
+                continue
             text = (message.get("text") or "").strip()
             if not text:
                 continue
@@ -3629,6 +4043,13 @@ Reglas:
 - Si es un DM casual sin pedido concreto, is_actionable=false.
 - Si hay un pedido de trabajo o seguimiento, is_actionable=true.
 - Identificá qué esperan que haga Ivan.
+- Si el mensaje pide armar, revisar, generar, exportar, validar o consultar un informe/reporte/dashboard usando links o datos de Salesforce, la categoría debe ser "salesforce".
+- Si hay URLs de Salesforce, agregá "salesforce" en external_systems.
+- Si el pedido requiere consultar Salesforce o usar campañas/registros de Salesforce, needs_external_system=true.
+- No clasifiques como "research" un pedido operativo de extracción, validación o armado de informe desde Salesforce.
+- El campo requested_action debe quedar redactado para que otro agente pueda ejecutar la tarea sin leer todo el hilo.
+- En requested_action incluí qué hay que hacer, período temporal si aparece, segmentación solicitada, fuentes o campañas indicadas y campos requeridos.
+- Ejemplo de requested_action bueno: "Armar un informe de altas 2026 por campaña principal/campaña de origen para las campañas indicadas en Salesforce, incluyendo datos de la persona —nombre y apellido, fecha de nacimiento/edad, residencia— y datos de donación —fecha establecida, estado, monto, fecha de finalización y campaña—."
 - Si falta información para actuar, listala.
 - El draft_reply debe ser breve, profesional, natural y en español argentino neutro.
 - No propongas ejecutar acciones riesgosas sin aprobación humana.
@@ -3727,7 +4148,11 @@ Reglas:
         conversation = state["conversation"]
         context_text = ""
         if state.get("relevant"):
-            context_text = self.fetch_recent_context(conversation["id"], message["ts"])
+            context_text = self.fetch_recent_context(
+                conversation["id"],
+                message["ts"],
+                thread_ts=message.get("thread_ts"),
+            )
         self.upsert_processed_relevance(
             channel_id=conversation["id"],
             message_ts=message["ts"],
@@ -3750,8 +4175,9 @@ Reglas:
         if not state.get("relevant"):
             return state
 
+        message_text = state["message"].get("text", "")
         classification = self.invoke_classification(
-            text=state["message"].get("text", ""),
+            text=message_text,
             sender_label=state["sender_label"],
             conversation_label=state["conversation_label"],
             relevance_reason=state.get("relevance_reason", ""),
@@ -3763,6 +4189,11 @@ Reglas:
                 channel_id=state["conversation"]["id"],
                 message_ts=state["message"]["ts"],
             ),
+        )
+        classification = normalize_classification_with_rules(
+            classification,
+            text=message_text,
+            message_links=state.get("message_links", []),
         )
         return {
             **state,
@@ -3812,6 +4243,7 @@ Reglas:
                 sender_label=state["sender_label"],
                 conversation_label=state["conversation_label"],
                 classification=classification,
+                raw_text=message.get("text", ""),
                 has_audio_transcript=bool(message.get("_audio_transcript_added")),
             )
             if inserted:
@@ -3944,6 +4376,11 @@ Reglas:
                     context_text=row["context_text"] or "",
                     links_text=self.get_message_links_context(row["channel_id"], row["message_ts"]),
                 )
+                classification = normalize_classification_with_rules(
+                    classification,
+                    text=row["raw_text"] or "",
+                    message_links=self.get_message_link_objects(row["channel_id"], row["message_ts"]),
+                )
                 self.mark_processed_done(
                     channel_id=row["channel_id"],
                     message_ts=row["message_ts"],
@@ -3960,6 +4397,7 @@ Reglas:
                         sender_label=row["sender_label"] or "unknown",
                         conversation_label=row["conversation_label"] or row["channel_id"],
                         classification=classification,
+                        raw_text=row["raw_text"] or "",
                         has_audio_transcript=False,
                     )
                     if inserted:

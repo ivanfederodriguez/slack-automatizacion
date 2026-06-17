@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 
 SLACK_LINK_RE = re.compile(r"<(https?://[^>|]+)(?:\|[^>]+)?>")
-PLAIN_URL_RE = re.compile(r"https?://[^\s<>()]+")
+PLAIN_URL_RE = re.compile(r"https?://[^\s<>()>|]+")
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 META_DESC_RE = re.compile(
     r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
@@ -38,6 +38,12 @@ def clean_extracted_url(url: str) -> str:
         cleaned = cleaned.split("|", 1)[0]
     while cleaned and cleaned[-1] in ".,);]>":
         cleaned = cleaned[:-1]
+    lowered = cleaned.lower()
+    if "salesforce.com" in lowered or "force.com" in lowered:
+        marker = "/viewconnect"
+        marker_index = lowered.find(marker)
+        if marker_index >= 0:
+            cleaned = cleaned[: marker_index + len("/view")]
     return cleaned
 
 
