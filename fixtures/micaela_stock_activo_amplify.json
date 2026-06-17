@@ -1,0 +1,38 @@
+{
+  "my_user_id": "UME",
+  "conversation": {
+    "id": "D_MICAELA",
+    "is_im": true,
+    "user": "UMICAELA"
+  },
+  "message": {
+    "ts": "1781715600.000000",
+    "user": "UMICAELA",
+    "text": "y por otro lado, estamos viendo con amplify para que nos armen otros perfiles de donantes con la misma lógica que el perfil que armaron de mirta te acordas? del análisis de datos del buyer techo. y me piden la base de donantes actualizada. sería informe de stock activo que tenga los datos de la persona (NyA, fecha de nacimiento/edad, lugar de residencia) y de la donación (fecha establecida, estado, monto, fecha de finalización, campaña). no sé qué otros datos les habían pasado en su momento"
+  },
+  "history_messages": [
+    {
+      "ts": "1781712000.000000",
+      "user": "UMICAELA",
+      "text": "Ivo, me armas un informe de altas 2026 por campaña principal/campaña de origen:\n• <https://techo.lightning.force.com/lightning/r/Campaign/7011W000001buEh/view|[IND] Campañas Pauta Digital>\n◦ amplify\n◦ orgánico web\n• <https://techo.lightning.force.com/lightning/r/Campaign/701Pe00000VtQrK/view|[IND] Redes Sociales>\n◦ <https://techo.lightning.force.com/lightning/r/701Pe00000QysD4IAJ/view|[IND] Redes Sociales - Instagram>\nque tenga los datos de la persona (NyA, fecha de nacimiento/edad, lugar de residencia) y de la donación (fecha establecida, estado, monto, fecha de finalización, campaña)"
+    },
+    {
+      "ts": "1781712300.000000",
+      "user": "UME",
+      "text": "Gracias mica por el detalle, me viene bien el mje para probar un sistema de informes automatico"
+    }
+  ],
+  "model_response": {
+    "is_actionable": true,
+    "summary": "Micaela pide armar un informe de donantes actualizado con lógica de perfiles de buyer techo.",
+    "requested_action": "Armar un informe de donantes actualizado con la misma lógica que el perfil de Mirta, enfocado en Amplify.",
+    "priority": "medium",
+    "category": "research",
+    "needs_reply": true,
+    "needs_external_system": false,
+    "external_systems": [],
+    "missing_information": [],
+    "suggested_next_step": "Analizar el pedido y preparar el informe.",
+    "draft_reply": "Dale, lo reviso."
+  }
+}

@@ -625,6 +625,59 @@ SALESFORCE_OPERATION_TERMS = (
     "revisar",
 )
 
+DONOR_DATA_OPERATION_TERMS = (
+    "armar",
+    "exportar",
+    "actualizar",
+    "generar",
+    "preparar",
+    "pasar",
+    "enviar",
+    "necesito",
+    "me piden",
+    "me armas",
+    "me armás",
+    "listado",
+    "informe",
+    "base",
+    "stock",
+)
+DONOR_DATA_ENTITY_TERMS = (
+    "base de donantes",
+    "donantes actualizada",
+    "donantes actualizado",
+    "base actualizada",
+    "stock activo",
+    "donante",
+    "donantes",
+)
+DONOR_DATA_FIELD_TERMS = (
+    "datos de la persona",
+    "datos personales",
+    "nya",
+    "nombre y apellido",
+    "fecha de nacimiento",
+    "edad",
+    "lugar de residencia",
+    "residencia",
+    "datos de la donacion",
+    "fecha establecida",
+    "estado",
+    "monto",
+    "fecha de finalizacion",
+    "campana",
+)
+NEW_REQUEST_STARTERS = (
+    "y por otro lado",
+    "por otro lado",
+    "otra cosa",
+    "ademas",
+    "tambien te queria pedir",
+    "tambien queria pedir",
+    "nuevo pedido",
+    "aparte",
+)
+
 
 def has_salesforce_url(message_links: list[MessageLink]) -> bool:
     return any(link.url_type == "salesforce" for link in message_links)
@@ -637,6 +690,63 @@ def has_salesforce_text_signal(text: str) -> bool:
     has_system = any(term in normalized for term in SALESFORCE_SYSTEM_TERMS)
     has_operation = any(term in normalized for term in SALESFORCE_OPERATION_TERMS)
     return has_system and has_operation
+
+
+def has_donor_data_request_signal(text: str) -> bool:
+    normalized = normalize_for_matching(text)
+    if not normalized:
+        return False
+    has_operation = any(term in normalized for term in DONOR_DATA_OPERATION_TERMS)
+    has_core_entity = any(term in normalized for term in DONOR_DATA_ENTITY_TERMS)
+    has_donation_dataset = "donacion" in normalized and any(
+        term in normalized for term in ("base", "listado", "stock")
+    )
+    has_entity = has_core_entity or has_donation_dataset
+    has_fields = any(term in normalized for term in DONOR_DATA_FIELD_TERMS)
+    return has_operation and has_entity and has_fields
+
+
+def starts_new_request(text: str) -> bool:
+    normalized = normalize_for_matching(text)
+    if not normalized:
+        return False
+    return any(normalized.startswith(starter) for starter in NEW_REQUEST_STARTERS)
+
+
+def improve_donor_data_requested_action(action: str, text: str) -> str:
+    normalized = normalize_for_matching(text)
+    if not has_donor_data_request_signal(text):
+        return action
+
+    if "stock activo" in normalized or "base de donantes" in normalized:
+        lead = "Armar un informe/base de donantes activos actualizado"
+        if "amplify" in normalized:
+            lead += " para Amplify"
+        details = []
+        if "mirta" in normalized or "buyer techo" in normalized:
+            details.append("siguiendo la lógica del perfil de Mirta / análisis buyer techo")
+        details.append("incluyendo datos personales y datos de donación solicitados")
+        return lead + ", " + ", ".join(details) + "."
+
+    cleaned = clean_text(action)
+    if cleaned and "datos personales" not in normalize_for_matching(cleaned):
+        return f"{cleaned.rstrip('.')}, incluyendo datos personales y datos de donación solicitados."
+    return cleaned
+
+
+def donor_data_missing_information(existing: list[str]) -> list[str]:
+    additions = [
+        "Confirmar fecha de corte del stock activo.",
+        "Confirmar si la fuente oficial de la base de donantes es Salesforce.",
+        "Confirmar si deben incluirse otros campos usados previamente en el perfil de Mirta.",
+        "Confirmar formato de entrega: CSV, Excel, Google Sheets o dashboard.",
+    ]
+    seen = {normalize_for_matching(item) for item in existing}
+    missing = list(existing)
+    for item in additions:
+        if normalize_for_matching(item) not in seen:
+            missing.append(item)
+    return missing
 
 
 def improve_salesforce_requested_action(action: str, text: str) -> str:
@@ -681,22 +791,31 @@ def normalize_classification_with_rules(
     message_links: list[MessageLink],
 ) -> SlackClassification:
     """Apply deterministic business rules that should outrank the local model."""
-    if not has_salesforce_url(message_links) and not has_salesforce_text_signal(text):
+    has_donor_signal = has_donor_data_request_signal(text)
+    if not has_salesforce_url(message_links) and not has_salesforce_text_signal(text) and not has_donor_signal:
         return classification
 
     external_systems = coerce_string_list(classification.external_systems)
     if "salesforce" not in {normalize_for_matching(system) for system in external_systems}:
         external_systems.append("salesforce")
+    requested_action = (
+        improve_donor_data_requested_action(classification.requested_action, text)
+        if has_donor_signal
+        else improve_salesforce_requested_action(classification.requested_action, text)
+    )
+    missing_information = (
+        donor_data_missing_information(coerce_string_list(classification.missing_information))
+        if has_donor_signal
+        else classification.missing_information
+    )
 
     return classification.model_copy(
         update={
             "category": "salesforce",
             "needs_external_system": True,
             "external_systems": external_systems,
-            "requested_action": improve_salesforce_requested_action(
-                classification.requested_action,
-                text,
-            ),
+            "requested_action": requested_action,
+            "missing_information": missing_information,
         }
     )
 
@@ -2318,6 +2437,50 @@ Reglas:
                 lines.append(f"- {group_name}: {fallback}.")
         return "\n".join(lines)
 
+    def build_donor_stock_public_request_text(self, *, raw_text: str, base_text: str) -> str:
+        source_text = "\n".join(piece for piece in (raw_text, base_text) if piece)
+        normalized = normalize_for_matching(source_text)
+        if not has_donor_data_request_signal(source_text):
+            return ""
+
+        lead = "Armar un informe/base de donantes activos actualizado"
+        if "amplify" in normalized:
+            lead += " para Amplify"
+        if "mirta" in normalized or "buyer techo" in normalized:
+            lead += ", siguiendo la lógica del perfil de Mirta / análisis buyer techo"
+        lead += "."
+
+        objectives = ["Entregar una base actualizada de donantes activos."]
+        if "amplify" in normalized:
+            objectives.append("Enfocar el informe en el canal Amplify.")
+        if "mirta" in normalized or "buyer techo" in normalized or "perfil" in normalized:
+            objectives.append("Usar una lógica similar a la utilizada para construir perfiles de donantes anteriores.")
+
+        blocks = [
+            lead,
+            "\n".join(["Objetivo:", *[f"- {objective}" for objective in objectives]]),
+        ]
+
+        fields_text = self.salesforce_required_fields_text(source_text)
+        if fields_text:
+            blocks.append("\n".join(["Campos requeridos:", fields_text]))
+
+        confirmation_items = [
+            "Fecha de corte del stock activo.",
+            "Fuente oficial de datos, probablemente Salesforce/CRM.",
+            "Si deben incluirse otros campos que se usaron previamente para el perfil de Mirta.",
+            "Formato de entrega esperado.",
+        ]
+        blocks.append(
+            "\n".join(
+                [
+                    "Información a confirmar:",
+                    *[f"- {item}" for item in confirmation_items],
+                ]
+            )
+        )
+        return "\n\n".join(blocks).strip()
+
     def build_salesforce_public_request_text(
         self,
         *,
@@ -2372,6 +2535,8 @@ Reglas:
         requester_label = row_value(task_row, "requester_label", "") or sender_label
         raw_text = row_value(task_row, "raw_text", "") or ""
         context_source = context_text or row_value(task_row, "context_text", "") or ""
+        if starts_new_request(raw_text):
+            context_source = ""
         requested_action = clean_text(classification.get("requested_action") or row_value(task_row, "requested_action", "") or "")
         base_text = requested_action or raw_text
         base_text = self._strip_public_request_prefix(
@@ -2387,6 +2552,12 @@ Reglas:
             )
 
         if self.is_salesforce_classification(classification):
+            donor_stock_text = self.build_donor_stock_public_request_text(
+                raw_text=raw_text,
+                base_text=base_text,
+            )
+            if donor_stock_text:
+                return donor_stock_text
             salesforce_text = self.build_salesforce_public_request_text(
                 classification=classification,
                 raw_text=raw_text,
@@ -3266,6 +3437,9 @@ Reglas:
             if message.get("thread_ts"):
                 return None
 
+            if starts_new_request(message.get("text", "")):
+                return None
+
             requester_user_id = message.get("user") or ""
             if self.config.case_grouping_window_minutes <= 0:
                 return None
@@ -4032,6 +4206,11 @@ Reglas:
     ) -> str:
         context_block = context_text or "Sin contexto reciente."
         links_block = links_text or "Sin URLs detectadas."
+        new_request_rule = (
+            "- El mensaje actual parece iniciar un pedido separado; no mezcles detalles del contexto previo salvo evidencia clara."
+            if starts_new_request(text)
+            else ""
+        )
         return f"""
 Sos el asistente personal de trabajo de Ivan Rodríguez.
 
@@ -4060,6 +4239,12 @@ Reglas:
 - Si hay URLs de Salesforce, agregá "salesforce" en external_systems.
 - Si el pedido requiere consultar Salesforce o usar campañas/registros de Salesforce, needs_external_system=true.
 - No clasifiques como "research" un pedido operativo de extracción, validación o armado de informe desde Salesforce.
+- Si el mensaje pide armar, actualizar, exportar, generar o preparar una base, listado, informe o stock de donantes, donaciones, altas, bajas o campañas, clasificalo como "salesforce" si requiere consultar datos del CRM/Salesforce.
+- No clasifiques como "research" pedidos operativos de extracción de datos, armado de base o informes de donantes, aunque el mensaje mencione análisis, perfiles, buyer persona, buyer techo o investigación.
+- "research" se reserva para búsqueda, análisis conceptual, benchmarking, lectura de fuentes externas o investigación sin extracción operativa de datos internos.
+- Si el pedido incluye campos como nombre y apellido, fecha de nacimiento, edad, residencia, monto, estado, fecha establecida, fecha de finalización o campaña, asumí que es una tarea de base/datos internos.
+- Si no hay link de Salesforce pero el pedido menciona base de donantes, stock activo, datos personales y datos de donación, marcá needs_external_system=true y agregá "salesforce" a external_systems, salvo que el mensaje indique explícitamente otra fuente.
+{new_request_rule}
 - El campo requested_action debe quedar redactado para que otro agente pueda ejecutar la tarea sin leer todo el hilo.
 - En requested_action incluí qué hay que hacer, período temporal si aparece, segmentación solicitada, fuentes o campañas indicadas y campos requeridos.
 - Ejemplo de requested_action bueno: "Armar un informe de altas 2026 por campaña principal/campaña de origen para las campañas indicadas en Salesforce, incluyendo datos de la persona —nombre y apellido, fecha de nacimiento/edad, residencia— y datos de donación —fecha establecida, estado, monto, fecha de finalización y campaña—."
@@ -4160,7 +4345,7 @@ Reglas:
         message = state["message"]
         conversation = state["conversation"]
         context_text = ""
-        if state.get("relevant"):
+        if state.get("relevant") and not starts_new_request(message.get("text", "")):
             context_text = self.fetch_recent_context(
                 conversation["id"],
                 message["ts"],

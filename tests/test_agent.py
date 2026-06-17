@@ -15,7 +15,9 @@ from slack_personal_agent import (
     AudioTranscriptFusion,
     SlackClassification,
     local_model_fit_hint,
+    normalize_classification_with_rules,
     parse_snooze_until,
+    starts_new_request,
     validate_trello_api_key_format,
 )
 from url_enrichment import extract_urls_from_text
@@ -295,6 +297,10 @@ def micaela_fixture_path():
     return Path(__file__).resolve().parents[1] / "fixtures" / "micaela_salesforce_report.json"
 
 
+def micaela_stock_fixture_path():
+    return Path(__file__).resolve().parents[1] / "fixtures" / "micaela_stock_activo_amplify.json"
+
+
 def insert_task(
     app,
     *,
@@ -469,6 +475,70 @@ def test_reprocess_message_dry_run_has_no_external_side_effects_and_shows_output
     assert "public_request_text" in output
     assert "Ayer hablábamos" not in result.context_text
     assert result.context_text == ""
+
+
+def test_micaela_donor_stock_fixture_reprocesses_research_as_salesforce(tmp_path):
+    result = run_reprocess_message_fixture(
+        config=make_config(tmp_path),
+        fixture_path=micaela_stock_fixture_path(),
+        dry_run=True,
+    )
+
+    assert result.model_classification.category == "research"
+    assert result.final_classification.category == "salesforce"
+    assert result.final_classification.needs_external_system is True
+    assert "salesforce" in result.final_classification.external_systems
+
+
+def test_micaela_donor_stock_public_text_does_not_mix_previous_context(tmp_path):
+    result = run_reprocess_message_fixture(
+        config=make_config(tmp_path),
+        fixture_path=micaela_stock_fixture_path(),
+        dry_run=True,
+    )
+    public_text = result.public_request_text
+
+    assert "donantes activos" in public_text
+    assert "Amplify" in public_text
+    assert "perfil de Mirta" in public_text
+    assert "buyer techo" in public_text
+    assert "Persona: nombre y apellido, fecha de nacimiento o edad, lugar de residencia." in public_text
+    assert "Donación: fecha establecida, estado, monto, fecha de finalización, campaña." in public_text
+    assert "altas 2026" not in public_text
+    assert "Pauta Digital" not in public_text
+    assert "Redes Sociales" not in public_text
+    assert "orgánico web" not in public_text
+    assert result.context_text == ""
+
+
+def test_conceptual_donor_research_is_not_forced_to_salesforce():
+    classification = make_classification(
+        requested_action="Investigar perfiles de donantes para una presentación.",
+        category="research",
+        needs_external_system=False,
+        external_systems=[],
+    )
+
+    normalized = normalize_classification_with_rules(
+        classification,
+        text="Quiero investigar perfiles de donantes y entender cómo se construye un buyer persona para una presentación.",
+        message_links=[],
+    )
+
+    assert normalized.category == "research"
+    assert normalized.needs_external_system is False
+    assert normalized.external_systems == []
+
+
+def test_starts_new_request_detects_separators():
+    for text in [
+        "y por otro lado, necesito otra base",
+        "otra cosa: me pasás esto?",
+        "además te quería pedir otro informe",
+        "aparte, revisamos este tema",
+        "también te quería pedir una base",
+    ]:
+        assert starts_new_request(text)
 
 
 def test_actionable_task_can_auto_sync_to_trello(tmp_path):

@@ -171,6 +171,12 @@ python main.py reprocess-message --fixture fixtures/micaela_salesforce_report.js
 
 En `--dry-run`, el comando usa una base temporal, no envía mensajes a Slack y no crea cards en Trello. La salida muestra el texto original, URLs extraídas, contexto usado, clasificación del modelo, clasificación final luego de reglas, `requested_action` y `public_request_text`.
 
+También sirve para probar pedidos sin URLs de Salesforce donde el sistema debe inferir que la tarea requiere CRM por el tipo de datos solicitados:
+
+```bash
+python main.py reprocess-message --fixture fixtures/micaela_stock_activo_amplify.json --dry-run --show-before-after
+```
+
 ## Flujo conversacional
 
 Cuando detecta una tarea accionable nueva, el agente responde en el thread original:
