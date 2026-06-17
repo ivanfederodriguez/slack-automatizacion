@@ -184,10 +184,12 @@ Después de mejorar reglas de clasificación o formato, se pueden recalcular tar
 ```bash
 python main.py reprocess-open-trello --dry-run
 python main.py reprocess-open-trello --dry-run --limit 10
+python main.py reprocess-open-trello --dry-run --only-category-changed --from-category research --to-category salesforce
+python main.py reprocess-open-trello --dry-run --task-id 23 --task-id 24
 python main.py reprocess-open-trello --apply
 ```
 
-Por seguridad, este comando no envía mensajes a Slack ni en `--dry-run` ni en `--apply`. En `--dry-run` solo imprime cambios posibles. Con `--apply`, actualiza SQLite y Trello para tareas abiertas con cambios relevantes, agrega auditoría interna y deja explícito en el resumen `Slack mensajes enviados: 0`.
+Por seguridad, este comando no envía mensajes a Slack ni en `--dry-run` ni en `--apply`. En `--dry-run` solo imprime cambios posibles y distingue `category_changed`, `public_text_changed_only`, `trello_create` y `trello_update`. Los filtros por categoría y `--task-id` permiten acotar el lote antes de aplicar cambios. Con `--apply`, actualiza SQLite y Trello para tareas abiertas con cambios relevantes, agrega auditoría interna y deja explícito en el resumen `Slack mensajes enviados: 0`.
 
 ## Flujo conversacional
 

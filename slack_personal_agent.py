@@ -182,6 +182,8 @@ class ReprocessExistingTaskResult:
     old_public_request_text: str
     new_public_request_text: str
     changed: bool
+    category_changed: bool
+    public_text_changed_only: bool
     trello_action: Literal["none", "update", "create", "skip"]
     applied: bool = False
     error: str = ""
@@ -201,6 +203,16 @@ class ReprocessOpenTrelloResult:
     errors: int
     slack_messages_sent: int
     tasks: list[ReprocessExistingTaskResult]
+
+
+@dataclass(frozen=True)
+class ReprocessTaskChanges:
+    old_classification: SlackClassification
+    new_classification: SlackClassification
+    new_public_request_text: str
+    changed: bool
+    category_changed: bool
+    public_text_changed_only: bool
 
 
 class AgentState(TypedDict, total=False):
@@ -2238,7 +2250,6 @@ Reglas:
                             "requested_action": classification.requested_action,
                         },
                         transcribed_audio=False,
-                        context_text="",
                     ),
                     classification.requested_action,
                     int(has_audio_transcript),
@@ -2534,9 +2545,8 @@ Reglas:
         classification: dict[str, Any],
         raw_text: str,
         base_text: str,
-        context_text: str,
     ) -> str:
-        source_text = "\n".join(piece for piece in (raw_text, base_text, context_text) if piece)
+        source_text = "\n".join(piece for piece in (raw_text, base_text) if piece)
         normalized_source = normalize_for_matching(source_text)
         if not any(term in normalized_source for term in ("informe", "reporte", "report", "dashboard", "tablero", "altas", "campana")):
             return ""
@@ -2574,16 +2584,13 @@ Reglas:
         *,
         task_row: sqlite3.Row,
         transcribed_audio: bool = False,
-        context_text: str = "",
     ) -> str:
+        """Build the task request itself; conversation context stays in separate metadata."""
         classification = self.classification_from_task_row(task_row)
 
         sender_label = row_value(task_row, "sender_label", "") or ""
         requester_label = row_value(task_row, "requester_label", "") or sender_label
         raw_text = row_value(task_row, "raw_text", "") or ""
-        context_source = context_text or row_value(task_row, "context_text", "") or ""
-        if starts_new_request(raw_text):
-            context_source = ""
         requested_action = clean_text(classification.get("requested_action") or row_value(task_row, "requested_action", "") or "")
         base_text = requested_action or raw_text
         base_text = self._strip_public_request_prefix(
@@ -2609,13 +2616,11 @@ Reglas:
                 classification=classification,
                 raw_text=raw_text,
                 base_text=base_text,
-                context_text=context_source,
             )
             if salesforce_text:
                 return salesforce_text
 
-        pieces = [piece for piece in (base_text, context_source.strip()) if piece]
-        public_text = "\n".join(pieces).strip()
+        public_text = base_text.strip()
         if not public_text:
             public_text = "Pedido recibido."
 
@@ -2728,7 +2733,6 @@ Reglas:
         request_text = task_row["public_request_text"] or self.build_public_request_text(
             task_row=task_row,
             transcribed_audio=transcribed_audio,
-            context_text=new_context_text,
         )
         prefix = "Buenísimo, transcribí el audio y lo sumo al pedido." if transcribed_audio else "Buenísimo, gracias. Lo sumo al pedido."
         blocks = [
@@ -3065,7 +3069,6 @@ Reglas:
                         self.build_public_request_text(
                             task_row=task_row,
                             transcribed_audio=bool(message.get("_audio_transcript_added")),
-                            context_text=text,
                         )
                         if text
                         else task_row["public_request_text"]
@@ -3790,6 +3793,7 @@ Reglas:
         limit: Optional[int] = None,
         only_trello_created: bool = False,
         include_waiting: bool = False,
+        task_ids: Optional[list[int]] = None,
     ) -> list[sqlite3.Row]:
         closed_statuses = (
             "done",
@@ -3809,6 +3813,11 @@ Reglas:
             clauses.append("COALESCE(tasks.status, 'new') NOT IN ('waiting_info', 'waiting_for_requester')")
         if only_trello_created:
             clauses.append("COALESCE(tasks.trello_card_id, '') != ''")
+        normalized_task_ids = sorted({int(task_id) for task_id in task_ids or []})
+        if normalized_task_ids:
+            task_placeholders = ", ".join("?" for _ in normalized_task_ids)
+            clauses.append(f"tasks.id IN ({task_placeholders})")
+            params.extend(normalized_task_ids)
 
         limit_clause = ""
         if limit is not None:
@@ -3883,7 +3892,7 @@ Reglas:
     def reprocess_task_changes(
         self,
         task_row: sqlite3.Row,
-    ) -> tuple[SlackClassification, SlackClassification, str, bool]:
+    ) -> ReprocessTaskChanges:
         old_classification = self.classification_model_from_task_row(task_row)
         raw_text = row_value(task_row, "raw_text", "") or row_value(task_row, "requested_action", "") or ""
         message_links = self.get_message_link_objects(
@@ -3902,20 +3911,30 @@ Reglas:
         new_systems = self.classification_external_systems(new_classification.model_dump())
         old_missing = coerce_string_list(old_classification.missing_information)
         new_missing = coerce_string_list(new_classification.missing_information)
-        changed = any(
+        category_changed = old_classification.category != new_classification.category
+        public_text_changed = (
+            normalize_comparable_text(row_value(task_row, "public_request_text", ""))
+            != normalize_comparable_text(new_public_request_text)
+        )
+        classification_changed = any(
             (
-                old_classification.category != new_classification.category,
+                category_changed,
                 normalize_comparable_text(old_classification.requested_action)
                 != normalize_comparable_text(new_classification.requested_action),
-                normalize_comparable_text(row_value(task_row, "public_request_text", ""))
-                != normalize_comparable_text(new_public_request_text),
                 bool(old_classification.needs_external_system) != bool(new_classification.needs_external_system),
                 sorted(old_systems) != sorted(new_systems),
                 [normalize_comparable_text(item) for item in old_missing]
                 != [normalize_comparable_text(item) for item in new_missing],
             )
         )
-        return old_classification, new_classification, new_public_request_text, changed
+        return ReprocessTaskChanges(
+            old_classification=old_classification,
+            new_classification=new_classification,
+            new_public_request_text=new_public_request_text,
+            changed=classification_changed or public_text_changed,
+            category_changed=category_changed,
+            public_text_changed_only=public_text_changed and not classification_changed,
+        )
 
     def reprocess_trello_audit_comment(
         self,
@@ -3992,7 +4011,11 @@ Reglas:
         *,
         apply: bool = False,
     ) -> ReprocessExistingTaskResult:
-        old_classification, new_classification, new_public_request_text, changed = self.reprocess_task_changes(task_row)
+        changes = self.reprocess_task_changes(task_row)
+        old_classification = changes.old_classification
+        new_classification = changes.new_classification
+        new_public_request_text = changes.new_public_request_text
+        changed = changes.changed
         old_public_request_text = row_value(task_row, "public_request_text", "") or ""
         old_systems = self.classification_external_systems(old_classification.model_dump())
         new_systems = self.classification_external_systems(new_classification.model_dump())
@@ -4088,6 +4111,8 @@ Reglas:
             old_public_request_text=old_public_request_text,
             new_public_request_text=new_public_request_text,
             changed=changed,
+            category_changed=changes.category_changed,
+            public_text_changed_only=changes.public_text_changed_only,
             trello_action=trello_action,
             applied=applied,
             error=error,
@@ -4102,22 +4127,33 @@ Reglas:
         only_salesforce: bool = False,
         only_trello_created: bool = False,
         include_waiting: bool = False,
+        only_category_changed: bool = False,
+        from_category: str = "",
+        to_category: str = "",
+        task_ids: Optional[list[int]] = None,
     ) -> ReprocessOpenTrelloResult:
         rows = self.fetch_open_tasks_for_reprocess(
-            limit=limit,
             only_trello_created=only_trello_created,
             include_waiting=include_waiting,
+            task_ids=task_ids,
         )
+        normalized_from_category = normalize_for_matching(from_category)
+        normalized_to_category = normalize_for_matching(to_category)
         task_results: list[ReprocessExistingTaskResult] = []
         for row in rows:
-            if only_salesforce:
-                preview = self.reprocess_existing_task(row, apply=False)
-                if preview.new_category != "salesforce" and "salesforce" not in preview.new_external_systems:
-                    continue
-                result = self.reprocess_existing_task(row, apply=apply) if apply else preview
-            else:
-                result = self.reprocess_existing_task(row, apply=apply)
+            preview = self.reprocess_existing_task(row, apply=False)
+            if only_salesforce and preview.new_category != "salesforce" and "salesforce" not in preview.new_external_systems:
+                continue
+            if only_category_changed and not preview.category_changed:
+                continue
+            if normalized_from_category and normalize_for_matching(preview.old_category) != normalized_from_category:
+                continue
+            if normalized_to_category and normalize_for_matching(preview.new_category) != normalized_to_category:
+                continue
+            result = self.reprocess_existing_task(row, apply=True) if apply else preview
             task_results.append(result)
+            if limit is not None and len(task_results) >= limit:
+                break
 
         changed = sum(1 for result in task_results if result.changed)
         errors = sum(1 for result in task_results if result.error)
@@ -6116,6 +6152,17 @@ def format_reprocess_open_trello_result(result: ReprocessOpenTrelloResult) -> st
         elif task.skipped_reason:
             lines.append(f"Omitida: {task.skipped_reason}")
         if task.changed:
+            change_types: list[str] = []
+            if task.category_changed:
+                change_types.append("category_changed")
+            if task.public_text_changed_only:
+                change_types.append("public_text_changed_only")
+            if task.trello_action == "create":
+                change_types.append("trello_create")
+            elif task.trello_action == "update":
+                change_types.append("trello_update")
+            if change_types:
+                lines.append(f"Tipos de cambio: {', '.join(change_types)}")
             lines.extend(
                 [
                     "Antes:",
@@ -6132,6 +6179,8 @@ def format_reprocess_open_trello_result(result: ReprocessOpenTrelloResult) -> st
             )
         else:
             lines.append("Sin cambios relevantes.")
+            if task.trello_action == "create":
+                lines.append("Tipos de cambio: trello_create")
         action_label = {
             "update": "actualizar card existente",
             "create": "crear card nueva",

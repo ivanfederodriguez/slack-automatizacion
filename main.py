@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit",
         type=int,
         default=None,
-        help="Cantidad máxima de tareas a mostrar con `tasks` o por sección en `brief`.",
+        help="Cantidad máxima para `tasks`, secciones de `brief` o tareas de `reprocess-open-trello`.",
     )
     parser.add_argument(
         "--reply",
@@ -105,6 +105,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-waiting",
         action="store_true",
         help="Con `reprocess-open-trello`, incluye tareas en espera de información.",
+    )
+    parser.add_argument(
+        "--only-category-changed",
+        action="store_true",
+        help="Con `reprocess-open-trello`, procesa solo tareas cuya categoría final cambia.",
+    )
+    parser.add_argument(
+        "--from-category",
+        default="",
+        help="Con `reprocess-open-trello`, filtra por categoría original.",
+    )
+    parser.add_argument(
+        "--to-category",
+        default="",
+        help="Con `reprocess-open-trello`, filtra por categoría final.",
+    )
+    parser.add_argument(
+        "--task-id",
+        dest="task_ids",
+        action="append",
+        type=int,
+        default=None,
+        help="Con `reprocess-open-trello`, limita a una tarea; se puede repetir.",
     )
     return parser
 
@@ -216,6 +239,10 @@ def main() -> int:
             only_salesforce=args.only_salesforce,
             only_trello_created=args.only_trello_created,
             include_waiting=args.include_waiting,
+            only_category_changed=args.only_category_changed,
+            from_category=args.from_category,
+            to_category=args.to_category,
+            task_ids=args.task_ids,
         )
         print(escape(format_reprocess_open_trello_result(result)))
         return 0 if result.errors == 0 else 1

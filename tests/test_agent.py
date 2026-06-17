@@ -15,6 +15,7 @@ from slack_personal_agent import (
     AudioTranscriptFusion,
     NoSlackSideEffectsAgentApp,
     SlackClassification,
+    format_reprocess_open_trello_result,
     local_model_fit_hint,
     normalize_classification_with_rules,
     parse_snooze_until,
@@ -424,6 +425,7 @@ def insert_reprocess_candidate(
     trello_status="created",
     trello_card_id="card123",
     public_request_text="Armar un informe de donantes actualizado.",
+    category="research",
 ):
     raw_text = donor_stock_raw_text()
     insert_processed_for_task(app, message_ts=message_ts, raw_text=raw_text)
@@ -435,7 +437,7 @@ def insert_reprocess_candidate(
         public_request_text=public_request_text,
         requested_action="Armar un informe de donantes actualizado con la misma lógica que el perfil de Mirta.",
         priority="medium",
-        category="research",
+        category=category,
         status=status,
         trello_status=trello_status,
         trello_card_id=trello_card_id,
@@ -443,7 +445,7 @@ def insert_reprocess_candidate(
         classification=make_classification(
             summary="Informe de donantes actualizado",
             requested_action="Armar un informe de donantes actualizado con la misma lógica que el perfil de Mirta.",
-            category="research",
+            category=category,
             needs_external_system=False,
             external_systems=[],
             missing_information=[],
@@ -1750,6 +1752,9 @@ def test_reprocess_open_trello_dry_run_has_no_side_effects(tmp_path):
     assert result.trello_would_update == 1
     assert result.slack_messages_sent == 0
     assert result.tasks[0].new_category == "salesforce"
+    output = format_reprocess_open_trello_result(result)
+    assert "category_changed" in output
+    assert "trello_update" in output
     assert task["category"] == "research"
     assert fake_trello.updated_cards == []
     assert fake_trello.created_cards == []
@@ -1979,6 +1984,142 @@ def test_reprocess_open_trello_without_changes_does_not_touch_trello(tmp_path):
     assert fake_trello.updated_cards == []
     assert fake_trello.created_cards == []
     assert fake_trello.comments == []
+
+
+def test_reprocess_open_trello_context_does_not_change_public_request_text(tmp_path):
+    fake_trello = FakeTrelloClient()
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_LIST_ID="list123"),
+        slack_client=FailingSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    message_ts = "60.3"
+    requested_action = "Preparar la agenda de la reunión mensual."
+    recent_context = "Ayer también conversamos sobre un presupuesto que no pertenece a este pedido."
+    insert_processed_for_task(
+        app,
+        message_ts=message_ts,
+        raw_text="¿Me preparás la agenda de la reunión mensual?",
+        context_text=recent_context,
+    )
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts=message_ts,
+        summary="Preparar agenda mensual",
+        public_request_text=requested_action,
+        requested_action=requested_action,
+        priority="medium",
+        category="admin",
+        trello_card_id="card123",
+        classification=make_classification(
+            summary="Preparar agenda mensual",
+            requested_action=requested_action,
+            category="admin",
+        ),
+    )
+
+    result = app.reprocess_open_trello_tasks(apply=False)
+    task_row = app.fetch_open_tasks_for_reprocess()[0]
+    _, description = app.build_trello_card_payload(task_row)
+
+    assert result.processed == 1
+    assert result.changed == 0
+    assert result.tasks[0].new_public_request_text == requested_action
+    assert recent_context not in result.tasks[0].new_public_request_text
+    assert "Contexto reciente:" in description
+    assert recent_context in description
+    assert fake_trello.updated_cards == []
+
+
+def test_reprocess_open_trello_labels_public_text_only_change(tmp_path):
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_LIST_ID="list123"),
+        slack_client=FailingSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=FakeTrelloClient(),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    message_ts = "60.31"
+    requested_action = "Preparar la agenda de la reunión mensual."
+    insert_processed_for_task(
+        app,
+        message_ts=message_ts,
+        raw_text="¿Me preparás la agenda de la reunión mensual?",
+    )
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts=message_ts,
+        summary="Preparar agenda mensual",
+        public_request_text="Texto público desactualizado.",
+        requested_action=requested_action,
+        priority="medium",
+        category="admin",
+        trello_card_id="card123",
+        classification=make_classification(
+            summary="Preparar agenda mensual",
+            requested_action=requested_action,
+            category="admin",
+        ),
+    )
+
+    result = app.reprocess_open_trello_tasks(apply=False)
+    output = format_reprocess_open_trello_result(result)
+
+    assert result.changed == 1
+    assert result.tasks[0].category_changed is False
+    assert result.tasks[0].public_text_changed_only is True
+    assert "public_text_changed_only" in output
+    assert "trello_update" in output
+
+
+def test_reprocess_open_trello_filters_research_to_salesforce(tmp_path):
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_LIST_ID="list123"),
+        slack_client=FailingSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=FakeTrelloClient(),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app, message_ts="60.4", category="research")
+    insert_reprocess_candidate(app, message_ts="60.5", category="data")
+
+    result = app.reprocess_open_trello_tasks(
+        apply=False,
+        from_category="research",
+        to_category="salesforce",
+    )
+
+    assert result.processed == 1
+    assert result.tasks[0].old_category == "research"
+    assert result.tasks[0].new_category == "salesforce"
+    assert result.tasks[0].category_changed is True
+
+
+def test_reprocess_open_trello_filters_specific_task_ids(tmp_path):
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_LIST_ID="list123"),
+        slack_client=FailingSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=FakeTrelloClient(),
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app, message_ts="60.6")
+    insert_reprocess_candidate(app, message_ts="60.7")
+    with sqlite3.connect(app.config.db_path) as conn:
+        task_ids = [row[0] for row in conn.execute("SELECT id FROM tasks ORDER BY id ASC").fetchall()]
+
+    result = app.reprocess_open_trello_tasks(apply=False, task_ids=[task_ids[1]])
+
+    assert result.processed == 1
+    assert [task.task_id for task in result.tasks] == [task_ids[1]]
 
 
 def test_reprocess_open_trello_does_not_call_slack_or_trello_to_slack_syncs(tmp_path):
@@ -3394,6 +3535,15 @@ def test_main_parser_accepts_reprocess_open_trello_command():
             "10",
             "--only-salesforce",
             "--only-trello-created",
+            "--only-category-changed",
+            "--from-category",
+            "research",
+            "--to-category",
+            "salesforce",
+            "--task-id",
+            "23",
+            "--task-id",
+            "24",
         ]
     )
     assert args.command == "reprocess-open-trello"
@@ -3401,6 +3551,10 @@ def test_main_parser_accepts_reprocess_open_trello_command():
     assert args.limit == 10
     assert args.only_salesforce
     assert args.only_trello_created
+    assert args.only_category_changed
+    assert args.from_category == "research"
+    assert args.to_category == "salesforce"
+    assert args.task_ids == [23, 24]
 
 
 def test_transcribe_audio_path_uses_injected_transcriber(tmp_path):
