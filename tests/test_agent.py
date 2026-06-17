@@ -1814,6 +1814,90 @@ def test_reprocess_open_trello_skips_closed_tasks(tmp_path):
     assert fake_trello.created_cards == []
 
 
+def test_reprocess_open_trello_skips_done_card_before_updating_db(tmp_path):
+    fake_trello = FakeTrelloClient(
+        card_state=TrelloCardState(
+            id="card123",
+            name="Informe de donantes",
+            url="https://trello.com/c/card123",
+            list_id="done-list",
+            list_name="Hecho",
+            closed=False,
+        )
+    )
+    fake_slack = FailingSlackClient()
+    app = NoSlackSideEffectsAgentApp(
+        make_config(
+            tmp_path,
+            TRELLO_ENABLED="true",
+            TRELLO_LIST_ID="list123",
+            TRELLO_DONE_MODE="list",
+        ),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app)
+    task_before = get_task(app.config.db_path)
+
+    result = app.reprocess_open_trello_tasks(apply=True)
+    task_after = get_task(app.config.db_path)
+    events = get_task_events(app.config.db_path, "task_reprocessed")
+
+    assert result.processed == 1
+    assert result.changed == 1
+    assert result.trello_updated == 0
+    assert result.tasks[0].trello_action == "skip"
+    assert "marcada como hecha" in result.tasks[0].skipped_reason
+    assert task_after["category"] == task_before["category"] == "research"
+    assert task_after["requested_action"] == task_before["requested_action"]
+    assert task_after["public_request_text"] == task_before["public_request_text"]
+    assert task_after["classification_json"] == task_before["classification_json"]
+    assert task_after["updated_at"] == task_before["updated_at"]
+    assert events == []
+    assert fake_trello.updated_cards == []
+    assert fake_trello.created_cards == []
+    assert fake_trello.comments == []
+    assert fake_slack.post_calls == []
+
+
+def test_reprocess_open_trello_trello_update_failure_keeps_classification_unchanged(tmp_path):
+    fake_trello = FakeTrelloClient()
+
+    def fail_update(*args, **kwargs):
+        raise RuntimeError("trello update failed")
+
+    fake_trello.update_card = fail_update
+    fake_slack = FailingSlackClient()
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_LIST_ID="list123"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app)
+    task_before = get_task(app.config.db_path)
+
+    result = app.reprocess_open_trello_tasks(apply=True)
+    task_after = get_task(app.config.db_path)
+    events = get_task_events(app.config.db_path, "task_reprocessed")
+
+    assert result.errors == 1
+    assert "trello update failed" in result.tasks[0].error
+    assert task_after["category"] == task_before["category"] == "research"
+    assert task_after["requested_action"] == task_before["requested_action"]
+    assert task_after["public_request_text"] == task_before["public_request_text"]
+    assert task_after["classification_json"] == task_before["classification_json"]
+    assert task_after["trello_status"] == "failed"
+    assert events == []
+    assert fake_trello.comments == []
+    assert fake_slack.post_calls == []
+
+
 def test_reprocess_open_trello_creates_card_when_missing(tmp_path):
     fake_trello = FakeTrelloClient()
     app = NoSlackSideEffectsAgentApp(

@@ -4014,41 +4014,32 @@ Reglas:
             new_classification,
             public_request_text=new_public_request_text,
         )
+        trello_client: Optional[TrelloClientProtocol] = None
 
-        if apply:
+        if apply and trello_card_id and trello_action == "update":
             try:
-                if changed:
-                    self.update_task_after_reprocess(
-                        task_row=task_row,
-                        old_classification=old_classification,
-                        new_classification=new_classification,
-                        new_public_request_text=new_public_request_text,
-                    )
+                trello_client = self.get_trello_client()
+                card_state = trello_client.get_card(trello_card_id)
+                if self.is_trello_card_done(card_state):
+                    trello_action = "skip"
+                    skipped_reason = "La card ya está marcada como hecha en Trello."
+            except Exception as exc:
+                error = str(exc)
+                self.mark_task_trello_failed(task_row["id"], error)
 
+        if apply and not skipped_reason and not error:
+            try:
                 if trello_card_id and trello_action == "update":
-                    client = self.get_trello_client()
-                    card_state = client.get_card(trello_card_id)
-                    if self.is_trello_card_done(card_state):
-                        trello_action = "skip"
-                        skipped_reason = "La card ya está marcada como hecha en Trello."
-                    else:
-                        name, description = self.build_trello_card_payload(updated_row)
-                        card_state = client.update_card(trello_card_id, name=name, desc=description)
-                        trello_card_url = card_state.url or trello_card_url
-                        client.add_card_comment(
-                            trello_card_id,
-                            self.reprocess_trello_audit_comment(
-                                old_classification=old_classification,
-                                new_classification=new_classification,
-                                changed=changed,
-                            ),
-                        )
-                        applied = True
+                    trello_client = trello_client or self.get_trello_client()
+                    name, description = self.build_trello_card_payload(updated_row)
+                    card_state = trello_client.update_card(trello_card_id, name=name, desc=description)
+                    trello_card_url = card_state.url or trello_card_url
                 elif not trello_card_id and trello_action == "create":
                     if not self.config.trello_list_id:
                         raise TrelloError("Falta TRELLO_LIST_ID para crear cards.")
                     name, description = self.build_trello_card_payload(updated_row)
-                    card = self.get_trello_client().create_card(
+                    trello_client = self.get_trello_client()
+                    card = trello_client.create_card(
                         list_id=self.config.trello_list_id,
                         name=name,
                         desc=description,
@@ -4059,6 +4050,24 @@ Reglas:
                     self.mark_task_trello_created(task_row["id"], card)
                     trello_card_id = card.id
                     trello_card_url = card.url
+
+                if changed:
+                    self.update_task_after_reprocess(
+                        task_row=task_row,
+                        old_classification=old_classification,
+                        new_classification=new_classification,
+                        new_public_request_text=new_public_request_text,
+                    )
+
+                if trello_card_id and trello_action in {"update", "create"} and trello_client:
+                    trello_client.add_card_comment(
+                        trello_card_id,
+                        self.reprocess_trello_audit_comment(
+                            old_classification=old_classification,
+                            new_classification=new_classification,
+                            changed=changed,
+                        ),
+                    )
                     applied = True
                 elif changed:
                     applied = True
