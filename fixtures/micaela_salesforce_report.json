@@ -1,0 +1,33 @@
+{
+  "my_user_id": "UME",
+  "conversation": {
+    "id": "D_MICAELA",
+    "is_im": true,
+    "user": "UMICAELA"
+  },
+  "message": {
+    "ts": "1781712000.000000",
+    "user": "UMICAELA",
+    "text": "Ivo, me armas un informe de altas 2026 por campaña principal/campaña de origen:\n• <https://techo.lightning.force.com/lightning/r/Campaign/7011W000001buEh/view|[IND] Campañas Pauta Digital>\n◦ amplify\n◦ orgánico web\n• <https://techo.lightning.force.com/lightning/r/Campaign/701Pe00000VtQrK/view|[IND] Redes Sociales>\n◦ <https://techo.lightning.force.com/lightning/r/701Pe00000QysD4IAJ/view|[IND] Redes Sociales - Instagram>\nque tenga los datos de la persona (NyA, fecha de nacimiento/edad, lugar de residencia) y de la donación (fecha establecida, estado, monto, fecha de finalización, campaña)"
+  },
+  "history_messages": [
+    {
+      "ts": "1781625600.000000",
+      "user": "UMICAELA",
+      "text": "Ayer hablábamos de otro análisis, no debería entrar como contexto."
+    }
+  ],
+  "model_response": {
+    "is_actionable": true,
+    "summary": "Micaela pide un informe de altas 2026.",
+    "requested_action": "Armar un informe de altas en 2026 por campaña principal/campaña de origen.",
+    "priority": "medium",
+    "category": "research",
+    "needs_reply": true,
+    "needs_external_system": false,
+    "external_systems": [],
+    "missing_information": [],
+    "suggested_next_step": "Relevar datos y armar el informe.",
+    "draft_reply": "Dale, lo reviso."
+  }
+}

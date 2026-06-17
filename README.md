@@ -88,6 +88,8 @@ POLL_SECONDS=300
 SLACK_SLEEP_SECONDS=1.2
 INCLUDE_SELF_FOR_TEST=false
 CASE_GROUPING_WINDOW_MINUTES=15
+CONTEXT_MAX_AGE_MINUTES=120
+LOCAL_TIMEZONE=America/Argentina/Cordoba
 SLACK_SEND_APPROVED_REPLIES=false
 FINAL_REPLY_MODE=telegram_approval
 
@@ -153,9 +155,21 @@ Notas utiles:
 - los canales publicos quedan fuera de alcance por ahora;
 - la base local por defecto es `slack_agent.db`;
 - en DMs, mensajes del mismo requester dentro de `CASE_GROUPING_WINDOW_MINUTES` se agrupan en el mismo caso aunque Slack no mande thread;
+- `CONTEXT_MAX_AGE_MINUTES` define cuántos minutos hacia atrás se usa contexto reciente en conversaciones sin thread;
+- `LOCAL_TIMEZONE` define el día local usado para evitar mezclar mensajes de días distintos;
 - si `TRELLO_ENABLED=false`, todo el flujo principal sigue funcionando sin Trello;
 - `FINAL_REPLY_MODE=telegram_approval` mantiene aprobacion por Telegram; `FINAL_REPLY_MODE=slack_auto` responde directo en Slack cuando Ivan marca la card como hecha.
 - si `TRELLO_ATTACH_SLACK_IMAGES=true`, el token de Slack necesita `files:read` para descargar imagenes privadas y adjuntarlas a Trello.
+
+## Reprocesar fixtures
+
+Para probar un mensaje real sin pedirle a la persona que lo vuelva a escribir en Slack, se puede usar un fixture JSON:
+
+```bash
+python main.py reprocess-message --fixture fixtures/micaela_salesforce_report.json --dry-run --show-before-after
+```
+
+En `--dry-run`, el comando usa una base temporal, no envía mensajes a Slack y no crea cards en Trello. La salida muestra el texto original, URLs extraídas, contexto usado, clasificación del modelo, clasificación final luego de reglas, `requested_action` y `public_request_text`.
 
 ## Flujo conversacional
 

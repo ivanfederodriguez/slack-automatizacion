@@ -1,10 +1,12 @@
 import json
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import slack_personal_agent
 from main import build_parser
+from replay import format_reprocess_message_result, run_reprocess_message_fixture
 import trello_client
 from trello_client import TrelloCard, TrelloCardState, TrelloClient, TrelloComment
 from slack_personal_agent import (
@@ -289,6 +291,10 @@ def image_file(**overrides):
     return payload
 
 
+def micaela_fixture_path():
+    return Path(__file__).resolve().parents[1] / "fixtures" / "micaela_salesforce_report.json"
+
+
 def insert_task(
     app,
     *,
@@ -421,6 +427,48 @@ def test_salesforce_report_request_overrides_research_classification(tmp_path):
     assert "Campañas/fuentes solicitadas:" in task["public_request_text"]
     assert "- [IND] Campañas Pauta Digital" in task["public_request_text"]
     assert "  - amplify" in task["public_request_text"]
+
+
+def test_micaela_fixture_reprocesses_research_as_salesforce(tmp_path):
+    result = run_reprocess_message_fixture(
+        config=make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_AUTO_CREATE="true"),
+        fixture_path=micaela_fixture_path(),
+        dry_run=True,
+    )
+
+    assert result.model_classification.category == "research"
+    assert result.final_classification.category == "salesforce"
+    assert result.final_classification.needs_external_system is True
+    assert result.final_classification.external_systems == ["salesforce"]
+    assert "para las campañas indicadas en Salesforce" in result.requested_action
+    assert "Campañas/fuentes solicitadas:" in result.public_request_text
+    assert "- [IND] Campañas Pauta Digital" in result.public_request_text
+    assert "  - amplify" in result.public_request_text
+    assert "  - orgánico web" in result.public_request_text
+    assert "- [IND] Redes Sociales" in result.public_request_text
+    assert "  - [IND] Redes Sociales - Instagram" in result.public_request_text
+    assert "Persona: nombre y apellido, fecha de nacimiento o edad, lugar de residencia." in result.public_request_text
+    assert "Donación: fecha establecida, estado, monto, fecha de finalización, campaña." in result.public_request_text
+
+
+def test_reprocess_message_dry_run_has_no_external_side_effects_and_shows_output(tmp_path):
+    result = run_reprocess_message_fixture(
+        config=make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_AUTO_CREATE="true"),
+        fixture_path=micaela_fixture_path(),
+        dry_run=True,
+    )
+    output = format_reprocess_message_result(result, show_before_after=True)
+
+    assert result.task_created is True
+    assert result.slack_post_calls == []
+    assert len(result.skipped_slack_posts) == 1
+    assert result.trello_enabled is False
+    assert "Clasificación del modelo" in output
+    assert "Clasificación final" in output
+    assert "salesforce" in output
+    assert "public_request_text" in output
+    assert "Ayer hablábamos" not in result.context_text
+    assert result.context_text == ""
 
 
 def test_actionable_task_can_auto_sync_to_trello(tmp_path):
@@ -2855,6 +2903,22 @@ def test_main_parser_accepts_trello_reply_sync_command():
     assert args.limit == 9
 
 
+def test_main_parser_accepts_reprocess_message_command():
+    args = build_parser().parse_args(
+        [
+            "reprocess-message",
+            "--fixture",
+            "fixtures/micaela_salesforce_report.json",
+            "--dry-run",
+            "--show-before-after",
+        ]
+    )
+    assert args.command == "reprocess-message"
+    assert args.fixture == "fixtures/micaela_salesforce_report.json"
+    assert args.dry_run
+    assert args.show_before_after
+
+
 def test_transcribe_audio_path_uses_injected_transcriber(tmp_path):
     fake_transcriber = FakeAudioTranscriber(["Texto transcripto local."])
     app = AgentApp(
@@ -3352,6 +3416,36 @@ def test_extract_salesforce_url_from_slack_link_drops_visible_text():
     ]
     assert "Connect your Salesforce account" not in urls[0]
     assert "[IND] Campañas Pauta Digital" not in urls[0]
+
+
+def test_extract_salesforce_urls_cleans_real_slack_noise():
+    clean_url = "https://techo.lightning.force.com/lightning/r/Campaign/7011W000001buEh/view"
+    cases = [
+        (
+            "<https://techo.lightning.force.com/lightning/r/Campaign/7011W000001buEh/view|[IND] Campañas Pauta Digital>",
+            clean_url,
+        ),
+        (
+            "https://techo.lightning.force.com/lightning/r/Campaign/7011W000001buEh/view%7C%5BIND%5DConnect your Salesforce account",
+            clean_url,
+        ),
+        (
+            "https://techo.lightning.force.com/lightning/r/Campaign/7011W000001buEh/viewConnect your Salesforce account",
+            clean_url,
+        ),
+        (
+            clean_url,
+            clean_url,
+        ),
+    ]
+
+    for raw_text, expected_url in cases:
+        urls = extract_urls_from_text(raw_text)
+        assert urls == [expected_url]
+        assert "%7C" not in urls[0]
+        assert "Connect your Salesforce account" not in urls[0]
+        assert "[IND]" not in urls[0]
+        assert "Campañas Pauta Digital" not in urls[0]
 
 
 def test_prompt_includes_public_url_enrichment(tmp_path):

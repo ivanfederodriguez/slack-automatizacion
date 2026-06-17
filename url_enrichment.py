@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 
 SLACK_LINK_RE = re.compile(r"<(https?://[^>|]+)(?:\|[^>]+)?>")
@@ -38,12 +38,28 @@ def clean_extracted_url(url: str) -> str:
         cleaned = cleaned.split("|", 1)[0]
     while cleaned and cleaned[-1] in ".,);]>":
         cleaned = cleaned[:-1]
-    lowered = cleaned.lower()
-    if "salesforce.com" in lowered or "force.com" in lowered:
-        marker = "/viewconnect"
-        marker_index = lowered.find(marker)
+
+    parsed = urlparse(cleaned)
+    host = (parsed.netloc or "").lower()
+    if not (host.endswith("salesforce.com") or host.endswith("force.com")):
+        return cleaned
+
+    encoded_separator = re.search(r"%7c", cleaned, flags=re.IGNORECASE)
+    if encoded_separator:
+        cleaned = cleaned[: encoded_separator.start()]
+
+    decoded = unquote(cleaned)
+    decoded_lowered = decoded.lower()
+    for marker in ("connect your salesforce account", " connect your salesforce account"):
+        marker_index = decoded_lowered.find(marker)
         if marker_index >= 0:
-            cleaned = cleaned[: marker_index + len("/view")]
+            cleaned = cleaned[:marker_index]
+            break
+
+    view_match = re.search(r"/view", cleaned, flags=re.IGNORECASE)
+    if view_match and len(cleaned) > view_match.end():
+        cleaned = cleaned[: view_match.end()]
+
     return cleaned
 
 

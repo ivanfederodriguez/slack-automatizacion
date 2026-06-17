@@ -1,9 +1,12 @@
 import argparse
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 from rich import print
+from rich.markup import escape
 
+from replay import format_reprocess_message_result, run_reprocess_message_fixture
 from slack_personal_agent import AgentApp, AgentConfig, ConfigError
 
 
@@ -29,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
             "telegram-poll",
             "transcribe-audio",
             "transcribe-audio-folder",
+            "reprocess-message",
             "install-autostart",
             "uninstall-autostart",
         ],
@@ -60,6 +64,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Con `review`, aprobar o editar también envía la respuesta en Slack.",
     )
+    parser.add_argument(
+        "--fixture",
+        default=None,
+        help="Fixture JSON para `reprocess-message`.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Con `reprocess-message`, usa DB temporal y no envía mensajes ni crea cards.",
+    )
+    parser.add_argument(
+        "--show-before-after",
+        action="store_true",
+        help="Con `reprocess-message`, muestra clasificación del modelo y clasificación final.",
+    )
     return parser
 
 
@@ -69,7 +88,12 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        config = AgentConfig.from_env()
+        if args.command == "reprocess-message":
+            env = dict(os.environ)
+            env.setdefault("SLACK_USER_TOKEN", "xoxp-replay-local-token")
+            config = AgentConfig.from_env(env)
+        else:
+            config = AgentConfig.from_env()
         app = AgentApp(config)
     except ConfigError as exc:
         print(f"[red]{exc}[/red]")
@@ -145,6 +169,16 @@ def main() -> int:
         for path, transcript in app.transcribe_audio_folder(Path(args.task_id)):
             print(f"\n[bold]{path.name}[/bold]")
             print(transcript)
+        return 0
+    if args.command == "reprocess-message":
+        if not args.fixture:
+            parser.error("reprocess-message requiere --fixture.")
+        result = run_reprocess_message_fixture(
+            config=config,
+            fixture_path=Path(args.fixture),
+            dry_run=args.dry_run,
+        )
+        print(escape(format_reprocess_message_result(result, show_before_after=args.show_before_after)))
         return 0
     if args.command == "install-autostart":
         app.install_autostart()

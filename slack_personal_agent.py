@@ -646,7 +646,14 @@ def improve_salesforce_requested_action(action: str, text: str) -> str:
 
     normalized_action = normalize_for_matching(cleaned)
     normalized_text = normalize_for_matching(text)
-    if "salesforce" not in normalized_action and (
+    if (
+        "campana" in normalized_text
+        and ("salesforce.com" in normalized_text or "force.com" in normalized_text)
+        and "campanas indicadas" not in normalized_action
+    ):
+        cleaned = re.sub(r"\s+en salesforce\.?$", "", cleaned.rstrip("."), flags=re.IGNORECASE)
+        cleaned = f"{cleaned.rstrip('.')} para las campañas indicadas en Salesforce."
+    elif "salesforce" not in normalized_action and (
         "campana" in normalized_action
         or "campana" in normalized_text
         or "reporte" in normalized_action
@@ -2229,13 +2236,16 @@ Reglas:
         ignored_labels = {"connect your salesforce account"}
 
         for line in str(text or "").splitlines():
-            matches = list(link_pattern.finditer(line))
+            bullet_match = re.match(r"^\s*([•◦\-*])\s+(.+?)\s*$", line)
+            bullet = bullet_match.group(1) if bullet_match else ""
+            content = bullet_match.group(2) if bullet_match else line.strip()
+            matches = list(link_pattern.finditer(content))
             salesforce_matches = [
                 match
                 for match in matches
                 if classify_url(match.group(1))[0] == "salesforce"
             ]
-            if salesforce_matches:
+            if salesforce_matches and (not bullet or bullet == "•" or current_index is None):
                 for match in salesforce_matches:
                     label = clean_text(match.group(2) or match.group(1))
                     if normalize_for_matching(label) in ignored_labels:
@@ -2244,10 +2254,9 @@ Reglas:
                     current_index = len(sections) - 1
                 continue
 
-            bullet_match = re.match(r"^\s*[-*•]\s+(.+?)\s*$", line)
             if bullet_match and current_index is not None:
                 label, items = sections[current_index]
-                item = self.strip_slack_link_markup(bullet_match.group(1)).strip()
+                item = self.strip_slack_link_markup(content).strip()
                 if item:
                     items.append(item)
                     sections[current_index] = (label, items)
@@ -2272,7 +2281,7 @@ Reglas:
             (
                 "Persona",
                 [
-                    ("nombre y apellido", ("nombre y apellido", "nombre completo")),
+                    ("nombre y apellido", ("nombre y apellido", "nombre completo", "nya")),
                     ("fecha de nacimiento o edad", ("fecha de nacimiento", "edad")),
                     ("lugar de residencia", ("lugar de residencia", "residencia")),
                     ("email", ("email", "correo")),
@@ -2322,17 +2331,21 @@ Reglas:
         if not any(term in normalized_source for term in ("informe", "reporte", "report", "dashboard", "tablero", "altas", "campana")):
             return ""
 
+        campaign_sections = self.extract_salesforce_campaign_sections(raw_text)
         request_text = self.strip_slack_link_markup(base_text).strip()
         request_text = re.sub(r"\s+", " ", request_text).strip()
         if not request_text:
             request_text = "Armar el informe solicitado en Salesforce."
-        if "salesforce" not in normalize_for_matching(request_text):
+        normalized_request = normalize_for_matching(request_text)
+        if campaign_sections and "campanas indicadas" not in normalized_request and "campañas indicadas" not in request_text.lower():
+            request_text = re.sub(r"\s+en salesforce\.?$", "", request_text.rstrip("."), flags=re.IGNORECASE)
+            request_text = f"{request_text.rstrip('.')} para las campañas indicadas en Salesforce."
+        elif "salesforce" not in normalized_request:
             request_text = f"{request_text.rstrip('.')} en Salesforce."
         else:
             request_text = f"{request_text.rstrip('.')}."
 
         blocks = [request_text]
-        campaign_sections = self.extract_salesforce_campaign_sections(raw_text)
         if campaign_sections:
             campaign_lines = ["Campañas/fuentes solicitadas:"]
             for label, items in campaign_sections:
