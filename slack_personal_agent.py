@@ -9,7 +9,7 @@ import time
 import unicodedata
 import webbrowser
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Protocol, TypedDict
@@ -3794,6 +3794,7 @@ Reglas:
         only_trello_created: bool = False,
         include_waiting: bool = False,
         task_ids: Optional[list[int]] = None,
+        ignore_local_status: bool = False,
     ) -> list[sqlite3.Row]:
         closed_statuses = (
             "done",
@@ -3804,13 +3805,14 @@ Reglas:
             "ignored",
             "responded",
         )
-        placeholders = ", ".join("?" for _ in closed_statuses)
-        clauses = [
-            f"COALESCE(tasks.status, 'new') NOT IN ({placeholders})",
-        ]
-        params: list[Any] = list(closed_statuses)
-        if not include_waiting:
-            clauses.append("COALESCE(tasks.status, 'new') NOT IN ('waiting_info', 'waiting_for_requester')")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if not ignore_local_status:
+            placeholders = ", ".join("?" for _ in closed_statuses)
+            clauses.append(f"COALESCE(tasks.status, 'new') NOT IN ({placeholders})")
+            params.extend(closed_statuses)
+            if not include_waiting:
+                clauses.append("COALESCE(tasks.status, 'new') NOT IN ('waiting_info', 'waiting_for_requester')")
         if only_trello_created:
             clauses.append("COALESCE(tasks.trello_card_id, '') != ''")
         normalized_task_ids = sorted({int(task_id) for task_id in task_ids or []})
@@ -3818,6 +3820,8 @@ Reglas:
             task_placeholders = ", ".join("?" for _ in normalized_task_ids)
             clauses.append(f"tasks.id IN ({task_placeholders})")
             params.extend(normalized_task_ids)
+        if not clauses:
+            clauses.append("1 = 1")
 
         limit_clause = ""
         if limit is not None:
@@ -4010,6 +4014,7 @@ Reglas:
         task_row: sqlite3.Row,
         *,
         apply: bool = False,
+        known_trello_card_state: Optional[TrelloCardState] = None,
     ) -> ReprocessExistingTaskResult:
         changes = self.reprocess_task_changes(task_row)
         old_classification = changes.old_classification
@@ -4042,7 +4047,7 @@ Reglas:
         if apply and trello_card_id and trello_action == "update":
             try:
                 trello_client = self.get_trello_client()
-                card_state = trello_client.get_card(trello_card_id)
+                card_state = known_trello_card_state or trello_client.get_card(trello_card_id)
                 if self.is_trello_card_done(card_state):
                     trello_action = "skip"
                     skipped_reason = "La card ya está marcada como hecha en Trello."
@@ -4131,16 +4136,36 @@ Reglas:
         from_category: str = "",
         to_category: str = "",
         task_ids: Optional[list[int]] = None,
+        only_open_trello_live: bool = False,
     ) -> ReprocessOpenTrelloResult:
         rows = self.fetch_open_tasks_for_reprocess(
-            only_trello_created=only_trello_created,
+            only_trello_created=only_trello_created or only_open_trello_live,
             include_waiting=include_waiting,
             task_ids=task_ids,
+            ignore_local_status=only_open_trello_live,
         )
         normalized_from_category = normalize_for_matching(from_category)
         normalized_to_category = normalize_for_matching(to_category)
         task_results: list[ReprocessExistingTaskResult] = []
+        successfully_processed = 0
         for row in rows:
+            live_card_state: Optional[TrelloCardState] = None
+            if only_open_trello_live:
+                try:
+                    live_card_state = self.get_trello_client().get_card(row_value(row, "trello_card_id", ""))
+                except Exception as exc:
+                    preview = self.reprocess_existing_task(row, apply=False)
+                    task_results.append(
+                        replace(
+                            preview,
+                            trello_action="skip",
+                            error=f"No pude consultar la card en Trello: {exc}",
+                        )
+                    )
+                    continue
+                if live_card_state.closed or self.is_trello_card_done(live_card_state):
+                    continue
+
             preview = self.reprocess_existing_task(row, apply=False)
             if only_salesforce and preview.new_category != "salesforce" and "salesforce" not in preview.new_external_systems:
                 continue
@@ -4150,22 +4175,32 @@ Reglas:
                 continue
             if normalized_to_category and normalize_for_matching(preview.new_category) != normalized_to_category:
                 continue
-            result = self.reprocess_existing_task(row, apply=True) if apply else preview
+            result = (
+                self.reprocess_existing_task(
+                    row,
+                    apply=True,
+                    known_trello_card_state=live_card_state,
+                )
+                if apply
+                else preview
+            )
             task_results.append(result)
-            if limit is not None and len(task_results) >= limit:
+            successfully_processed += 1
+            if limit is not None and successfully_processed >= limit:
                 break
 
-        changed = sum(1 for result in task_results if result.changed)
+        counted_results = [result for result in task_results if not result.error] if only_open_trello_live else task_results
+        changed = sum(1 for result in counted_results if result.changed)
         errors = sum(1 for result in task_results if result.error)
         return ReprocessOpenTrelloResult(
             dry_run=not apply,
-            processed=len(task_results),
+            processed=len(counted_results),
             changed=changed,
-            unchanged=len(task_results) - changed,
-            trello_would_update=sum(1 for result in task_results if not apply and result.trello_action == "update"),
-            trello_would_create=sum(1 for result in task_results if not apply and result.trello_action == "create"),
-            trello_updated=sum(1 for result in task_results if apply and result.trello_action == "update" and result.applied),
-            trello_created=sum(1 for result in task_results if apply and result.trello_action == "create" and result.applied),
+            unchanged=len(counted_results) - changed,
+            trello_would_update=sum(1 for result in counted_results if not apply and result.trello_action == "update"),
+            trello_would_create=sum(1 for result in counted_results if not apply and result.trello_action == "create"),
+            trello_updated=sum(1 for result in counted_results if apply and result.trello_action == "update" and result.applied),
+            trello_created=sum(1 for result in counted_results if apply and result.trello_action == "create" and result.applied),
             errors=errors,
             slack_messages_sent=0,
             tasks=task_results,

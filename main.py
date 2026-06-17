@@ -102,6 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Con `reprocess-open-trello`, procesa solo tareas con card Trello existente.",
     )
     parser.add_argument(
+        "--only-open-trello-live",
+        action="store_true",
+        help="Con `reprocess-open-trello`, consulta Trello y procesa solo cards actualmente abiertas.",
+    )
+    parser.add_argument(
         "--include-waiting",
         action="store_true",
         help="Con `reprocess-open-trello`, incluye tareas en espera de información.",
@@ -238,6 +243,7 @@ def main() -> int:
             limit=args.limit,
             only_salesforce=args.only_salesforce,
             only_trello_created=args.only_trello_created,
+            only_open_trello_live=args.only_open_trello_live,
             include_waiting=args.include_waiting,
             only_category_changed=args.only_category_changed,
             from_category=args.from_category,

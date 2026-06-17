@@ -127,7 +127,15 @@ class FakeSlackClient:
 
 
 class FakeTrelloClient:
-    def __init__(self, should_fail=False, card_state=None, card_comments=None, attachment_error=None):
+    def __init__(
+        self,
+        should_fail=False,
+        card_state=None,
+        card_comments=None,
+        attachment_error=None,
+        card_states=None,
+        get_card_errors=None,
+    ):
         self.should_fail = should_fail
         self.attachment_error = attachment_error
         self.card_state = card_state or TrelloCardState(
@@ -139,6 +147,9 @@ class FakeTrelloClient:
             closed=False,
         )
         self.card_comments = list(card_comments or [])
+        self.card_states = dict(card_states or {})
+        self.get_card_errors = dict(get_card_errors or {})
+        self.get_card_calls = []
         self.created_cards = []
         self.updated_cards = []
         self.comments = []
@@ -161,21 +172,25 @@ class FakeTrelloClient:
         if self.should_fail:
             raise RuntimeError("trello down")
         self.updated_cards.append({"card_id": card_id, "name": name, "desc": desc})
+        current_state = self.card_states.get(card_id, self.card_state)
         return TrelloCardState(
             id=card_id,
-            name=name or self.card_state.name,
-            url=self.card_state.url,
-            list_id=self.card_state.list_id,
-            list_name=self.card_state.list_name,
-            closed=self.card_state.closed,
-            due_complete=self.card_state.due_complete,
-            checklist_items=self.card_state.checklist_items,
+            name=name or current_state.name,
+            url=current_state.url,
+            list_id=current_state.list_id,
+            list_name=current_state.list_name,
+            closed=current_state.closed,
+            due_complete=current_state.due_complete,
+            checklist_items=current_state.checklist_items,
         )
 
     def get_card(self, card_id):
+        self.get_card_calls.append(card_id)
         if self.should_fail:
             raise RuntimeError("trello down")
-        return self.card_state
+        if card_id in self.get_card_errors:
+            raise self.get_card_errors[card_id]
+        return self.card_states.get(card_id, self.card_state)
 
     def get_card_comments(self, card_id, limit=50):
         if self.should_fail:
@@ -2122,6 +2137,226 @@ def test_reprocess_open_trello_filters_specific_task_ids(tmp_path):
     assert [task.task_id for task in result.tasks] == [task_ids[1]]
 
 
+def test_reprocess_open_trello_live_excludes_cards_in_done_list(tmp_path):
+    card_id = "card-done-list"
+    fake_trello = FakeTrelloClient(
+        card_states={
+            card_id: TrelloCardState(
+                id=card_id,
+                name="Terminada",
+                url=f"https://trello.com/c/{card_id}",
+                list_id="done-list",
+                list_name="Hecho",
+                closed=False,
+            )
+        }
+    )
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_DONE_MODE="list"),
+        slack_client=FailingSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app, trello_card_id=card_id)
+
+    result = app.reprocess_open_trello_tasks(apply=False, only_open_trello_live=True)
+
+    assert fake_trello.get_card_calls == [card_id]
+    assert result.processed == 0
+    assert result.tasks == []
+    assert result.trello_would_update == 0
+
+
+def test_reprocess_open_trello_live_excludes_due_complete_cards(tmp_path):
+    card_id = "card-due-complete"
+    fake_trello = FakeTrelloClient(
+        card_states={
+            card_id: TrelloCardState(
+                id=card_id,
+                name="Terminada",
+                url=f"https://trello.com/c/{card_id}",
+                list_id="inbox",
+                list_name="Inbox",
+                closed=False,
+                due_complete=True,
+            )
+        }
+    )
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_DONE_MODE="check"),
+        slack_client=FailingSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app, trello_card_id=card_id)
+
+    result = app.reprocess_open_trello_tasks(apply=False, only_open_trello_live=True)
+
+    assert fake_trello.get_card_calls == [card_id]
+    assert result.processed == 0
+    assert result.tasks == []
+
+
+def test_reprocess_open_trello_live_includes_open_card_even_if_local_task_is_done(tmp_path):
+    card_id = "card-open"
+    fake_trello = FakeTrelloClient(
+        card_states={
+            card_id: TrelloCardState(
+                id=card_id,
+                name="Abierta",
+                url=f"https://trello.com/c/{card_id}",
+                list_id="inbox",
+                list_name="Inbox",
+                closed=False,
+            )
+        }
+    )
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_DONE_MODE="list"),
+        slack_client=FailingSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app, status="done", trello_card_id=card_id)
+
+    result = app.reprocess_open_trello_tasks(apply=False, only_open_trello_live=True)
+
+    assert result.processed == 1
+    assert [task.task_id for task in result.tasks] == [1]
+    assert result.trello_would_update == 1
+    assert result.trello_would_create == 0
+
+
+def test_reprocess_open_trello_live_dry_run_reads_trello_without_side_effects(tmp_path):
+    card_id = "card-live-dry-run"
+    fake_trello = FakeTrelloClient(
+        card_states={
+            card_id: TrelloCardState(
+                id=card_id,
+                name="Abierta",
+                url=f"https://trello.com/c/{card_id}",
+                list_id="inbox",
+                list_name="Inbox",
+                closed=False,
+            )
+        }
+    )
+    fake_slack = FailingSlackClient()
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app, trello_card_id=card_id)
+    task_before = get_task(app.config.db_path)
+
+    result = app.reprocess_open_trello_tasks(apply=False, only_open_trello_live=True)
+    task_after = get_task(app.config.db_path)
+
+    assert result.processed == 1
+    assert result.slack_messages_sent == 0
+    assert fake_trello.get_card_calls == [card_id]
+    assert fake_trello.updated_cards == []
+    assert fake_trello.created_cards == []
+    assert fake_trello.comments == []
+    assert dict(task_after) == dict(task_before)
+    assert fake_slack.post_calls == []
+
+
+def test_reprocess_open_trello_live_apply_updates_only_open_cards(tmp_path):
+    open_card_id = "card-live-open"
+    done_card_id = "card-live-done"
+    fake_trello = FakeTrelloClient(
+        card_states={
+            open_card_id: TrelloCardState(
+                id=open_card_id,
+                name="Abierta",
+                url=f"https://trello.com/c/{open_card_id}",
+                list_id="inbox",
+                list_name="Inbox",
+                closed=False,
+            ),
+            done_card_id: TrelloCardState(
+                id=done_card_id,
+                name="Terminada",
+                url=f"https://trello.com/c/{done_card_id}",
+                list_id="done-list",
+                list_name="Hecho",
+                closed=False,
+            ),
+        }
+    )
+    fake_slack = FailingSlackClient()
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_DONE_MODE="list"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app, message_ts="60.8", trello_card_id=open_card_id)
+    insert_reprocess_candidate(app, message_ts="60.9", trello_card_id=done_card_id)
+
+    result = app.reprocess_open_trello_tasks(apply=True, only_open_trello_live=True)
+    with sqlite3.connect(app.config.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        tasks = {
+            row["trello_card_id"]: row
+            for row in conn.execute("SELECT * FROM tasks ORDER BY id ASC").fetchall()
+        }
+
+    assert result.processed == 1
+    assert result.trello_updated == 1
+    assert result.trello_created == 0
+    assert [call["card_id"] for call in fake_trello.updated_cards] == [open_card_id]
+    assert tasks[open_card_id]["category"] == "salesforce"
+    assert tasks[done_card_id]["category"] == "research"
+    assert fake_slack.post_calls == []
+    assert result.slack_messages_sent == 0
+
+
+def test_reprocess_open_trello_live_get_card_failure_reports_error_without_db_changes(tmp_path):
+    card_id = "card-live-error"
+    fake_trello = FakeTrelloClient(
+        get_card_errors={card_id: RuntimeError("trello lookup failed")},
+    )
+    fake_slack = FailingSlackClient()
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app, trello_card_id=card_id)
+    task_before = get_task(app.config.db_path)
+
+    result = app.reprocess_open_trello_tasks(apply=True, only_open_trello_live=True)
+    task_after = get_task(app.config.db_path)
+
+    assert result.processed == 0
+    assert result.errors == 1
+    assert len(result.tasks) == 1
+    assert "trello lookup failed" in result.tasks[0].error
+    assert dict(task_after) == dict(task_before)
+    assert fake_trello.updated_cards == []
+    assert fake_trello.created_cards == []
+    assert fake_trello.comments == []
+    assert fake_slack.post_calls == []
+    assert result.slack_messages_sent == 0
+
+
 def test_reprocess_open_trello_does_not_call_slack_or_trello_to_slack_syncs(tmp_path):
     fake_trello = FakeTrelloClient()
     app = NoSlackSideEffectsAgentApp(
@@ -3535,6 +3770,7 @@ def test_main_parser_accepts_reprocess_open_trello_command():
             "10",
             "--only-salesforce",
             "--only-trello-created",
+            "--only-open-trello-live",
             "--only-category-changed",
             "--from-category",
             "research",
@@ -3551,6 +3787,7 @@ def test_main_parser_accepts_reprocess_open_trello_command():
     assert args.limit == 10
     assert args.only_salesforce
     assert args.only_trello_created
+    assert args.only_open_trello_live
     assert args.only_category_changed
     assert args.from_category == "research"
     assert args.to_category == "salesforce"
