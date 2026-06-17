@@ -169,6 +169,40 @@ class SlackVisualAttachment:
     size_bytes: int = 0
 
 
+@dataclass(frozen=True)
+class ReprocessExistingTaskResult:
+    task_id: int
+    trello_card_url: str
+    old_category: str
+    new_category: str
+    old_external_systems: list[str]
+    new_external_systems: list[str]
+    old_requested_action: str
+    new_requested_action: str
+    old_public_request_text: str
+    new_public_request_text: str
+    changed: bool
+    trello_action: Literal["none", "update", "create", "skip"]
+    applied: bool = False
+    error: str = ""
+    skipped_reason: str = ""
+
+
+@dataclass(frozen=True)
+class ReprocessOpenTrelloResult:
+    dry_run: bool
+    processed: int
+    changed: int
+    unchanged: int
+    trello_would_update: int
+    trello_would_create: int
+    trello_updated: int
+    trello_created: int
+    errors: int
+    slack_messages_sent: int
+    tasks: list[ReprocessExistingTaskResult]
+
+
 class AgentState(TypedDict, total=False):
     message: dict[str, Any]
     conversation: dict[str, Any]
@@ -203,6 +237,15 @@ class TrelloClientProtocol(Protocol):
         member_ids: Optional[list[str]] = None,
         label_ids: Optional[list[str]] = None,
     ) -> TrelloCard:
+        ...
+
+    def update_card(
+        self,
+        card_id: str,
+        *,
+        name: Optional[str] = None,
+        desc: Optional[str] = None,
+    ) -> TrelloCardState:
         ...
 
     def get_card(self, card_id: str) -> TrelloCardState:
@@ -280,6 +323,10 @@ def compact_text(value: Any, max_length: int = 140) -> str:
 
 def clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def normalize_comparable_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
 def row_value(row: Any, key: str, default: Any = "") -> Any:
@@ -3593,19 +3640,22 @@ Reglas:
         return row is not None
 
     def build_trello_card_payload(self, task_row: sqlite3.Row) -> tuple[str, str]:
-        summary = task_row["summary"] or "Nueva tarea desde Slack"
-        action = task_row["public_request_text"] or task_row["requested_action"] or "Sin acción especificada"
-        raw_text = task_row["raw_text"] or ""
-        context_text = task_row["context_text"] or ""
-        context_additions = self.task_context_additions_text(task_row["id"])
-        links_text = self.get_message_links_context(task_row["channel_id"], task_row["message_ts"])
+        summary = row_value(task_row, "summary", "") or "Nueva tarea desde Slack"
+        action = row_value(task_row, "public_request_text", "") or row_value(task_row, "requested_action", "") or "Sin acción especificada"
+        raw_text = row_value(task_row, "raw_text", "") or ""
+        context_text = row_value(task_row, "context_text", "") or ""
+        task_id = int(row_value(task_row, "id", 0) or 0)
+        channel_id = row_value(task_row, "channel_id", "") or ""
+        message_ts = row_value(task_row, "message_ts", "") or ""
+        context_additions = self.task_context_additions_text(task_id) if task_id else ""
+        links_text = self.get_message_links_context(channel_id, message_ts) if channel_id and message_ts else "Sin URLs detectadas."
         name = summary[:120]
         description = "\n".join(
             [
-                f"Conversación: {task_row['conversation_label']}",
-                f"Remitente: {task_row['sender_label']}",
-                f"Prioridad: {task_row['priority']}",
-                f"Categoría: {task_row['category']}",
+                f"Conversación: {row_value(task_row, 'conversation_label', '')}",
+                f"Remitente: {row_value(task_row, 'sender_label', '')}",
+                f"Prioridad: {row_value(task_row, 'priority', '')}",
+                f"Categoría: {row_value(task_row, 'category', '')}",
                 "",
                 f"Acción pedida: {action}",
                 "",
@@ -3733,6 +3783,348 @@ Reglas:
         for row in rows:
             synced += int(self.sync_task_to_trello(row))
         return synced
+
+    def fetch_open_tasks_for_reprocess(
+        self,
+        *,
+        limit: Optional[int] = None,
+        only_trello_created: bool = False,
+        include_waiting: bool = False,
+    ) -> list[sqlite3.Row]:
+        closed_statuses = (
+            "done",
+            "closed",
+            "cancelled",
+            "archived",
+            "dismissed",
+            "ignored",
+            "responded",
+        )
+        placeholders = ", ".join("?" for _ in closed_statuses)
+        clauses = [
+            f"COALESCE(tasks.status, 'new') NOT IN ({placeholders})",
+        ]
+        params: list[Any] = list(closed_statuses)
+        if not include_waiting:
+            clauses.append("COALESCE(tasks.status, 'new') NOT IN ('waiting_info', 'waiting_for_requester')")
+        if only_trello_created:
+            clauses.append("COALESCE(tasks.trello_card_id, '') != ''")
+
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = "LIMIT ?"
+            params.append(limit)
+
+        with self.db_connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT tasks.*,
+                       processed_messages.raw_text,
+                       processed_messages.context_text
+                FROM tasks
+                LEFT JOIN processed_messages
+                  ON processed_messages.channel_id = tasks.channel_id
+                 AND processed_messages.message_ts = tasks.message_ts
+                WHERE {" AND ".join(clauses)}
+                ORDER BY tasks.created_at ASC, tasks.id ASC
+                {limit_clause}
+                """,
+                tuple(params),
+            ).fetchall()
+        return list(rows)
+
+    def classification_model_from_task_row(self, task_row: sqlite3.Row) -> SlackClassification:
+        payload = self.classification_from_task_row(task_row)
+        allowed_categories = {
+            "salesforce",
+            "data",
+            "software",
+            "research",
+            "meeting",
+            "admin",
+            "fundraising",
+            "communications",
+            "other",
+        }
+        category = str(payload.get("category") or row_value(task_row, "category", "") or "other")
+        if category not in allowed_categories:
+            category = "other"
+        fallback = {
+            "is_actionable": True,
+            "summary": row_value(task_row, "summary", "") or "Tarea desde Slack",
+            "requested_action": row_value(task_row, "requested_action", "") or "Revisar tarea.",
+            "priority": row_value(task_row, "priority", "") or "medium",
+            "category": category,
+            "needs_reply": bool(payload.get("needs_reply", True)),
+            "needs_external_system": bool(payload.get("needs_external_system", False)),
+            "external_systems": coerce_string_list(payload.get("external_systems")),
+            "missing_information": coerce_string_list(payload.get("missing_information")),
+            "suggested_next_step": payload.get("suggested_next_step") or "",
+            "draft_reply": payload.get("draft_reply") or "",
+        }
+        fallback.update({key: value for key, value in payload.items() if value not in (None, "")})
+        return SlackClassification.model_validate(fallback)
+
+    def task_row_with_reprocessed_values(
+        self,
+        task_row: sqlite3.Row,
+        classification: SlackClassification,
+        public_request_text: str = "",
+    ) -> dict[str, Any]:
+        updated = dict(task_row)
+        updated["category"] = classification.category
+        updated["priority"] = classification.priority
+        updated["requested_action"] = classification.requested_action
+        updated["classification_json"] = json.dumps(classification.model_dump(), ensure_ascii=False)
+        if public_request_text:
+            updated["public_request_text"] = public_request_text
+        return updated
+
+    def reprocess_task_changes(
+        self,
+        task_row: sqlite3.Row,
+    ) -> tuple[SlackClassification, SlackClassification, str, bool]:
+        old_classification = self.classification_model_from_task_row(task_row)
+        raw_text = row_value(task_row, "raw_text", "") or row_value(task_row, "requested_action", "") or ""
+        message_links = self.get_message_link_objects(
+            row_value(task_row, "channel_id", ""),
+            row_value(task_row, "message_ts", ""),
+        )
+        new_classification = normalize_classification_with_rules(
+            old_classification,
+            text=raw_text,
+            message_links=message_links,
+        )
+        temp_row = self.task_row_with_reprocessed_values(task_row, new_classification)
+        new_public_request_text = self.build_public_request_text(task_row=temp_row)
+
+        old_systems = self.classification_external_systems(old_classification.model_dump())
+        new_systems = self.classification_external_systems(new_classification.model_dump())
+        old_missing = coerce_string_list(old_classification.missing_information)
+        new_missing = coerce_string_list(new_classification.missing_information)
+        changed = any(
+            (
+                old_classification.category != new_classification.category,
+                normalize_comparable_text(old_classification.requested_action)
+                != normalize_comparable_text(new_classification.requested_action),
+                normalize_comparable_text(row_value(task_row, "public_request_text", ""))
+                != normalize_comparable_text(new_public_request_text),
+                bool(old_classification.needs_external_system) != bool(new_classification.needs_external_system),
+                sorted(old_systems) != sorted(new_systems),
+                [normalize_comparable_text(item) for item in old_missing]
+                != [normalize_comparable_text(item) for item in new_missing],
+            )
+        )
+        return old_classification, new_classification, new_public_request_text, changed
+
+    def reprocess_trello_audit_comment(
+        self,
+        *,
+        old_classification: SlackClassification,
+        new_classification: SlackClassification,
+        changed: bool,
+    ) -> str:
+        systems = self.classification_external_systems(new_classification.model_dump())
+        lines = [
+            "Tarea reprocesada automáticamente con nuevas reglas de clasificación.",
+            "Cambios principales:",
+        ]
+        if old_classification.category != new_classification.category:
+            lines.append(f"- Categoría: {old_classification.category} -> {new_classification.category}")
+        if systems:
+            lines.append(f"- Sistema externo: {', '.join(system.title() for system in systems)}")
+        if changed:
+            lines.append("- Descripción actualizada para reflejar mejor el pedido original.")
+        else:
+            lines.append("- Sin cambios relevantes de clasificación o descripción.")
+        lines.append("No se envió ningún mensaje a Slack.")
+        return "\n".join(lines)
+
+    def update_task_after_reprocess(
+        self,
+        *,
+        task_row: sqlite3.Row,
+        old_classification: SlackClassification,
+        new_classification: SlackClassification,
+        new_public_request_text: str,
+    ) -> None:
+        timestamp = now_iso()
+        old_public_request_text = row_value(task_row, "public_request_text", "") or ""
+        with self.db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET category = ?,
+                    priority = ?,
+                    requested_action = ?,
+                    public_request_text = ?,
+                    classification_json = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    new_classification.category,
+                    new_classification.priority,
+                    new_classification.requested_action,
+                    new_public_request_text,
+                    json.dumps(new_classification.model_dump(), ensure_ascii=False),
+                    timestamp,
+                    task_row["id"],
+                ),
+            )
+        self.record_task_event(
+            task_row["id"],
+            "task_reprocessed",
+            {
+                "old_category": old_classification.category,
+                "new_category": new_classification.category,
+                "old_requested_action": old_classification.requested_action,
+                "new_requested_action": new_classification.requested_action,
+                "old_public_request_text": old_public_request_text,
+                "new_public_request_text": new_public_request_text,
+                "slack_messages_sent": 0,
+            },
+        )
+
+    def reprocess_existing_task(
+        self,
+        task_row: sqlite3.Row,
+        *,
+        apply: bool = False,
+    ) -> ReprocessExistingTaskResult:
+        old_classification, new_classification, new_public_request_text, changed = self.reprocess_task_changes(task_row)
+        old_public_request_text = row_value(task_row, "public_request_text", "") or ""
+        old_systems = self.classification_external_systems(old_classification.model_dump())
+        new_systems = self.classification_external_systems(new_classification.model_dump())
+        trello_card_id = row_value(task_row, "trello_card_id", "") or ""
+        trello_card_url = row_value(task_row, "trello_card_url", "") or ""
+        trello_status = row_value(task_row, "trello_status", "") or ""
+        trello_action: Literal["none", "update", "create", "skip"] = "none"
+
+        if trello_card_id:
+            trello_action = "update" if changed else "none"
+        elif trello_status in {"pending", "failed", "", None}:
+            trello_action = "create"
+
+        applied = False
+        error = ""
+        skipped_reason = ""
+        updated_row = self.task_row_with_reprocessed_values(
+            task_row,
+            new_classification,
+            public_request_text=new_public_request_text,
+        )
+
+        if apply:
+            try:
+                if changed:
+                    self.update_task_after_reprocess(
+                        task_row=task_row,
+                        old_classification=old_classification,
+                        new_classification=new_classification,
+                        new_public_request_text=new_public_request_text,
+                    )
+
+                if trello_card_id and trello_action == "update":
+                    client = self.get_trello_client()
+                    card_state = client.get_card(trello_card_id)
+                    if self.is_trello_card_done(card_state):
+                        trello_action = "skip"
+                        skipped_reason = "La card ya está marcada como hecha en Trello."
+                    else:
+                        name, description = self.build_trello_card_payload(updated_row)
+                        card_state = client.update_card(trello_card_id, name=name, desc=description)
+                        trello_card_url = card_state.url or trello_card_url
+                        client.add_card_comment(
+                            trello_card_id,
+                            self.reprocess_trello_audit_comment(
+                                old_classification=old_classification,
+                                new_classification=new_classification,
+                                changed=changed,
+                            ),
+                        )
+                        applied = True
+                elif not trello_card_id and trello_action == "create":
+                    if not self.config.trello_list_id:
+                        raise TrelloError("Falta TRELLO_LIST_ID para crear cards.")
+                    name, description = self.build_trello_card_payload(updated_row)
+                    card = self.get_trello_client().create_card(
+                        list_id=self.config.trello_list_id,
+                        name=name,
+                        desc=description,
+                        pos=self.config.trello_card_position,
+                        member_ids=list(self.config.trello_member_ids),
+                        label_ids=list(self.config.trello_label_ids),
+                    )
+                    self.mark_task_trello_created(task_row["id"], card)
+                    trello_card_id = card.id
+                    trello_card_url = card.url
+                    applied = True
+                elif changed:
+                    applied = True
+            except Exception as exc:
+                error = str(exc)
+                if trello_action in {"update", "create"}:
+                    self.mark_task_trello_failed(task_row["id"], error)
+
+        return ReprocessExistingTaskResult(
+            task_id=task_row["id"],
+            trello_card_url=trello_card_url,
+            old_category=old_classification.category,
+            new_category=new_classification.category,
+            old_external_systems=old_systems,
+            new_external_systems=new_systems,
+            old_requested_action=old_classification.requested_action,
+            new_requested_action=new_classification.requested_action,
+            old_public_request_text=old_public_request_text,
+            new_public_request_text=new_public_request_text,
+            changed=changed,
+            trello_action=trello_action,
+            applied=applied,
+            error=error,
+            skipped_reason=skipped_reason,
+        )
+
+    def reprocess_open_trello_tasks(
+        self,
+        *,
+        apply: bool = False,
+        limit: Optional[int] = None,
+        only_salesforce: bool = False,
+        only_trello_created: bool = False,
+        include_waiting: bool = False,
+    ) -> ReprocessOpenTrelloResult:
+        rows = self.fetch_open_tasks_for_reprocess(
+            limit=limit,
+            only_trello_created=only_trello_created,
+            include_waiting=include_waiting,
+        )
+        task_results: list[ReprocessExistingTaskResult] = []
+        for row in rows:
+            if only_salesforce:
+                preview = self.reprocess_existing_task(row, apply=False)
+                if preview.new_category != "salesforce" and "salesforce" not in preview.new_external_systems:
+                    continue
+                result = self.reprocess_existing_task(row, apply=apply) if apply else preview
+            else:
+                result = self.reprocess_existing_task(row, apply=apply)
+            task_results.append(result)
+
+        changed = sum(1 for result in task_results if result.changed)
+        errors = sum(1 for result in task_results if result.error)
+        return ReprocessOpenTrelloResult(
+            dry_run=not apply,
+            processed=len(task_results),
+            changed=changed,
+            unchanged=len(task_results) - changed,
+            trello_would_update=sum(1 for result in task_results if not apply and result.trello_action == "update"),
+            trello_would_create=sum(1 for result in task_results if not apply and result.trello_action == "create"),
+            trello_updated=sum(1 for result in task_results if apply and result.trello_action == "update" and result.applied),
+            trello_created=sum(1 for result in task_results if apply and result.trello_action == "create" and result.applied),
+            errors=errors,
+            slack_messages_sent=0,
+            tasks=task_results,
+        )
 
     def is_trello_card_done_by_check(self, card: TrelloCardState) -> bool:
         return bool(card.due_complete)
@@ -5672,3 +6064,85 @@ Reglas:
             print("[dim]Trello no está habilitado.[/dim]")
 
         return ok
+
+
+class NoSlackSideEffectsAgentApp(AgentApp):
+    def slack_call(self, method: Callable[..., Any], **kwargs: Any) -> Any:
+        if getattr(method, "__name__", "") == "chat_postMessage":
+            raise RuntimeError("reprocess-open-trello no puede enviar mensajes a Slack")
+        return super().slack_call(method, **kwargs)
+
+    def send_task_acknowledgement(self, task_id: int) -> bool:
+        raise RuntimeError("reprocess-open-trello no puede enviar mensajes a Slack")
+
+    def send_context_acknowledgement(self, *args: Any, **kwargs: Any) -> bool:
+        raise RuntimeError("reprocess-open-trello no puede enviar mensajes a Slack")
+
+    def approve_reply(self, *args: Any, **kwargs: Any) -> bool:
+        raise RuntimeError("reprocess-open-trello no puede enviar respuestas a Slack")
+
+    def send_slack_auto_final_reply(self, task_row: sqlite3.Row) -> bool:
+        raise RuntimeError("reprocess-open-trello no puede enviar respuestas finales a Slack")
+
+    def send_waiting_request_to_slack(self, *args: Any, **kwargs: Any) -> bool:
+        raise RuntimeError("reprocess-open-trello no puede pedir información por Slack")
+
+    def send_trello_reply_to_slack(self, *args: Any, **kwargs: Any) -> bool:
+        raise RuntimeError("reprocess-open-trello no puede enviar respuestas de Trello a Slack")
+
+    def sync_trello_reply_commands(self, limit: int = 50) -> int:
+        raise RuntimeError("reprocess-open-trello no puede sincronizar respuestas de Trello hacia Slack")
+
+    def sync_trello_waiting_requests(self, limit: int = 50) -> int:
+        raise RuntimeError("reprocess-open-trello no puede sincronizar pedidos de Trello hacia Slack")
+
+
+def format_reprocess_open_trello_result(result: ReprocessOpenTrelloResult) -> str:
+    lines: list[str] = []
+    for task in result.tasks:
+        lines.append(f"Tarea #{task.task_id}")
+        lines.append(f"Trello: {task.trello_card_url or '(sin card)'}")
+        if task.error:
+            lines.append(f"Error: {task.error}")
+        elif task.skipped_reason:
+            lines.append(f"Omitida: {task.skipped_reason}")
+        if task.changed:
+            lines.extend(
+                [
+                    "Antes:",
+                    f"- category: {task.old_category}",
+                    f"- external_systems: [{', '.join(task.old_external_systems)}]",
+                    f"- requested_action: {task.old_requested_action}",
+                    f"- public_request_text: {task.old_public_request_text}",
+                    "Después:",
+                    f"- category: {task.new_category}",
+                    f"- external_systems: [{', '.join(task.new_external_systems)}]",
+                    f"- requested_action: {task.new_requested_action}",
+                    f"- public_request_text: {task.new_public_request_text}",
+                ]
+            )
+        else:
+            lines.append("Sin cambios relevantes.")
+        action_label = {
+            "update": "actualizar card existente",
+            "create": "crear card nueva",
+            "skip": "no tocar card",
+            "none": "sin acción Trello",
+        }.get(task.trello_action, task.trello_action)
+        lines.extend(["Acción Trello:", f"- {action_label}", ""])
+
+    lines.extend(
+        [
+            "Resumen final:",
+            f"Reprocesadas: {result.processed}",
+            f"Con cambios: {result.changed}",
+            f"Sin cambios: {result.unchanged}",
+            f"Actualizaría Trello: {result.trello_would_update}",
+            f"Crearía Trello: {result.trello_would_create}",
+            f"Actualizadas en Trello: {result.trello_updated}",
+            f"Creadas en Trello: {result.trello_created}",
+            f"Errores: {result.errors}",
+            f"Slack mensajes enviados: {result.slack_messages_sent}",
+        ]
+    )
+    return "\n".join(lines)

@@ -177,6 +177,18 @@ También sirve para probar pedidos sin URLs de Salesforce donde el sistema debe 
 python main.py reprocess-message --fixture fixtures/micaela_stock_activo_amplify.json --dry-run --show-before-after
 ```
 
+## Reprocesar tareas abiertas en Trello
+
+Después de mejorar reglas de clasificación o formato, se pueden recalcular tareas abiertas ya guardadas y revisar qué cambiaría en sus cards de Trello:
+
+```bash
+python main.py reprocess-open-trello --dry-run
+python main.py reprocess-open-trello --dry-run --limit 10
+python main.py reprocess-open-trello --apply
+```
+
+Por seguridad, este comando no envía mensajes a Slack ni en `--dry-run` ni en `--apply`. En `--dry-run` solo imprime cambios posibles. Con `--apply`, actualiza SQLite y Trello para tareas abiertas con cambios relevantes, agrega auditoría interna y deja explícito en el resumen `Slack mensajes enviados: 0`.
+
 ## Flujo conversacional
 
 Cuando detecta una tarea accionable nueva, el agente responde en el thread original:

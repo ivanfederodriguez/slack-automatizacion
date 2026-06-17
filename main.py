@@ -7,7 +7,13 @@ from rich import print
 from rich.markup import escape
 
 from replay import format_reprocess_message_result, run_reprocess_message_fixture
-from slack_personal_agent import AgentApp, AgentConfig, ConfigError
+from slack_personal_agent import (
+    AgentApp,
+    AgentConfig,
+    ConfigError,
+    NoSlackSideEffectsAgentApp,
+    format_reprocess_open_trello_result,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
             "transcribe-audio",
             "transcribe-audio-folder",
             "reprocess-message",
+            "reprocess-open-trello",
             "install-autostart",
             "uninstall-autostart",
         ],
@@ -72,12 +79,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Con `reprocess-message`, usa DB temporal y no envía mensajes ni crea cards.",
+        help="Con `reprocess-message` o `reprocess-open-trello`, no modifica DB/Trello ni envía mensajes.",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Con `reprocess-open-trello`, aplica cambios en SQLite y Trello.",
     )
     parser.add_argument(
         "--show-before-after",
         action="store_true",
         help="Con `reprocess-message`, muestra clasificación del modelo y clasificación final.",
+    )
+    parser.add_argument(
+        "--only-salesforce",
+        action="store_true",
+        help="Con `reprocess-open-trello`, procesa solo tareas que quedan relacionadas con Salesforce.",
+    )
+    parser.add_argument(
+        "--only-trello-created",
+        action="store_true",
+        help="Con `reprocess-open-trello`, procesa solo tareas con card Trello existente.",
+    )
+    parser.add_argument(
+        "--include-waiting",
+        action="store_true",
+        help="Con `reprocess-open-trello`, incluye tareas en espera de información.",
     )
     return parser
 
@@ -88,13 +115,13 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        if args.command == "reprocess-message":
+        if args.command in {"reprocess-message", "reprocess-open-trello"}:
             env = dict(os.environ)
             env.setdefault("SLACK_USER_TOKEN", "xoxp-replay-local-token")
             config = AgentConfig.from_env(env)
         else:
             config = AgentConfig.from_env()
-        app = AgentApp(config)
+        app = NoSlackSideEffectsAgentApp(config) if args.command == "reprocess-open-trello" else AgentApp(config)
     except ConfigError as exc:
         print(f"[red]{exc}[/red]")
         return 1
@@ -180,6 +207,18 @@ def main() -> int:
         )
         print(escape(format_reprocess_message_result(result, show_before_after=args.show_before_after)))
         return 0
+    if args.command == "reprocess-open-trello":
+        if args.dry_run and args.apply:
+            parser.error("reprocess-open-trello no acepta --dry-run y --apply juntos.")
+        result = app.reprocess_open_trello_tasks(
+            apply=args.apply,
+            limit=args.limit,
+            only_salesforce=args.only_salesforce,
+            only_trello_created=args.only_trello_created,
+            include_waiting=args.include_waiting,
+        )
+        print(escape(format_reprocess_open_trello_result(result)))
+        return 0 if result.errors == 0 else 1
     if args.command == "install-autostart":
         app.install_autostart()
         return 0

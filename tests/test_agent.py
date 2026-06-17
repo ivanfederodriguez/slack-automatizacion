@@ -13,6 +13,7 @@ from slack_personal_agent import (
     AgentApp,
     AgentConfig,
     AudioTranscriptFusion,
+    NoSlackSideEffectsAgentApp,
     SlackClassification,
     local_model_fit_hint,
     normalize_classification_with_rules,
@@ -138,6 +139,7 @@ class FakeTrelloClient:
         )
         self.card_comments = list(card_comments or [])
         self.created_cards = []
+        self.updated_cards = []
         self.comments = []
         self.file_attachments = []
         self.url_attachments = []
@@ -153,6 +155,21 @@ class FakeTrelloClient:
             raise RuntimeError("trello down")
         self.created_cards.append(kwargs)
         return TrelloCard(id="card123", name=kwargs["name"], url="https://trello.com/c/card123")
+
+    def update_card(self, card_id, *, name=None, desc=None):
+        if self.should_fail:
+            raise RuntimeError("trello down")
+        self.updated_cards.append({"card_id": card_id, "name": name, "desc": desc})
+        return TrelloCardState(
+            id=card_id,
+            name=name or self.card_state.name,
+            url=self.card_state.url,
+            list_id=self.card_state.list_id,
+            list_name=self.card_state.list_name,
+            closed=self.card_state.closed,
+            due_complete=self.card_state.due_complete,
+            checklist_items=self.card_state.checklist_items,
+        )
 
     def get_card(self, card_id):
         if self.should_fail:
@@ -200,6 +217,11 @@ class FakeTelegramClient:
 
     def get_updates(self, offset=None, limit=20):
         return list(self.updates[:limit])
+
+
+class FailingSlackClient(FakeSlackClient):
+    def chat_postMessage(self, **kwargs):
+        raise AssertionError("No debería enviar Slack en reprocess-open-trello")
 
 
 class FakeAudioTranscriber:
@@ -301,6 +323,31 @@ def micaela_stock_fixture_path():
     return Path(__file__).resolve().parents[1] / "fixtures" / "micaela_stock_activo_amplify.json"
 
 
+def donor_stock_raw_text():
+    return (
+        "y por otro lado, estamos viendo con amplify para que nos armen otros perfiles de donantes "
+        "con la misma lógica que el perfil que armaron de mirta te acordas? del análisis de datos "
+        "del buyer techo. y me piden la base de donantes actualizada. sería informe de stock activo "
+        "que tenga los datos de la persona (NyA, fecha de nacimiento/edad, lugar de residencia) y "
+        "de la donación (fecha establecida, estado, monto, fecha de finalización, campaña). no sé "
+        "qué otros datos les habían pasado en su momento"
+    )
+
+
+def insert_processed_for_task(app, *, message_ts, raw_text, context_text=""):
+    app.upsert_processed_relevance(
+        channel_id=f"D{message_ts}",
+        message_ts=message_ts,
+        user_id="UOTHER",
+        sender_label="Ana Gomez",
+        conversation_label="DM con Ana Gomez",
+        raw_text=raw_text,
+        relevant=True,
+        relevance_reason="fixture",
+        context_text=context_text,
+    )
+
+
 def insert_task(
     app,
     *,
@@ -367,6 +414,41 @@ def insert_task(
                 classification.model_dump_json(),
             ),
         )
+
+
+def insert_reprocess_candidate(
+    app,
+    *,
+    message_ts="60.0",
+    status="new",
+    trello_status="created",
+    trello_card_id="card123",
+    public_request_text="Armar un informe de donantes actualizado.",
+):
+    raw_text = donor_stock_raw_text()
+    insert_processed_for_task(app, message_ts=message_ts, raw_text=raw_text)
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts=message_ts,
+        summary="Informe de donantes actualizado",
+        public_request_text=public_request_text,
+        requested_action="Armar un informe de donantes actualizado con la misma lógica que el perfil de Mirta.",
+        priority="medium",
+        category="research",
+        status=status,
+        trello_status=trello_status,
+        trello_card_id=trello_card_id,
+        trello_card_url="https://trello.com/c/card123" if trello_card_id else "",
+        classification=make_classification(
+            summary="Informe de donantes actualizado",
+            requested_action="Armar un informe de donantes actualizado con la misma lógica que el perfil de Mirta.",
+            category="research",
+            needs_external_system=False,
+            external_systems=[],
+            missing_information=[],
+        ),
+    )
 
 
 def test_dm_actionable_creates_task(tmp_path):
@@ -1647,6 +1729,196 @@ def test_trello_failure_marks_task_as_failed(tmp_path):
     assert "trello down" in task["trello_last_error"]
 
 
+def test_reprocess_open_trello_dry_run_has_no_side_effects(tmp_path):
+    fake_trello = FakeTrelloClient()
+    fake_slack = FailingSlackClient()
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_LIST_ID="list123"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app)
+
+    result = app.reprocess_open_trello_tasks(apply=False)
+    task = get_task(app.config.db_path)
+
+    assert result.processed == 1
+    assert result.changed == 1
+    assert result.trello_would_update == 1
+    assert result.slack_messages_sent == 0
+    assert result.tasks[0].new_category == "salesforce"
+    assert task["category"] == "research"
+    assert fake_trello.updated_cards == []
+    assert fake_trello.created_cards == []
+    assert fake_trello.comments == []
+    assert fake_slack.post_calls == []
+
+
+def test_reprocess_open_trello_apply_updates_db_and_trello_without_slack(tmp_path):
+    fake_trello = FakeTrelloClient()
+    fake_slack = FailingSlackClient()
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_LIST_ID="list123"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app)
+
+    result = app.reprocess_open_trello_tasks(apply=True)
+    task = get_task(app.config.db_path)
+    classification = json.loads(task["classification_json"])
+    events = get_task_events(app.config.db_path, "task_reprocessed")
+
+    assert result.processed == 1
+    assert result.changed == 1
+    assert result.trello_updated == 1
+    assert result.slack_messages_sent == 0
+    assert task["category"] == "salesforce"
+    assert classification["category"] == "salesforce"
+    assert "donantes activos" in task["public_request_text"]
+    assert "Amplify" in task["public_request_text"]
+    assert "perfil de Mirta" in task["public_request_text"]
+    assert "buyer techo" in task["public_request_text"]
+    assert len(fake_trello.updated_cards) == 1
+    assert fake_trello.created_cards == []
+    assert any("No se envió ningún mensaje a Slack." in comment["text"] for comment in fake_trello.comments)
+    assert len(events) == 1
+    assert json.loads(events[0]["details_json"])["slack_messages_sent"] == 0
+    assert fake_slack.post_calls == []
+
+
+def test_reprocess_open_trello_skips_closed_tasks(tmp_path):
+    fake_trello = FakeTrelloClient()
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_LIST_ID="list123"),
+        slack_client=FailingSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app, status="done")
+
+    result = app.reprocess_open_trello_tasks(apply=True)
+    task = get_task(app.config.db_path)
+
+    assert result.processed == 0
+    assert task["category"] == "research"
+    assert fake_trello.updated_cards == []
+    assert fake_trello.created_cards == []
+
+
+def test_reprocess_open_trello_creates_card_when_missing(tmp_path):
+    fake_trello = FakeTrelloClient()
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_LIST_ID="list123"),
+        slack_client=FailingSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app, trello_status="pending", trello_card_id="")
+
+    result = app.reprocess_open_trello_tasks(apply=True)
+    task = get_task(app.config.db_path)
+
+    assert result.trello_created == 1
+    assert len(fake_trello.created_cards) == 1
+    assert fake_trello.updated_cards == []
+    assert task["trello_card_id"] == "card123"
+    assert task["trello_card_url"] == "https://trello.com/c/card123"
+    assert task["trello_status"] == "created"
+
+
+def test_reprocess_open_trello_does_not_duplicate_existing_card(tmp_path):
+    fake_trello = FakeTrelloClient()
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_LIST_ID="list123"),
+        slack_client=FailingSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app, trello_card_id="card123")
+
+    result = app.reprocess_open_trello_tasks(apply=True)
+
+    assert result.trello_updated == 1
+    assert len(fake_trello.updated_cards) == 1
+    assert fake_trello.created_cards == []
+
+
+def test_reprocess_open_trello_without_changes_does_not_touch_trello(tmp_path):
+    fake_trello = FakeTrelloClient()
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_LIST_ID="list123"),
+        slack_client=FailingSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    message_ts = "60.1"
+    requested_action = "Comparar el reporte con Salesforce."
+    insert_processed_for_task(app, message_ts=message_ts, raw_text="Comparás esto con Salesforce?")
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts=message_ts,
+        summary="Revisar reporte",
+        public_request_text=requested_action,
+        requested_action=requested_action,
+        priority="medium",
+        category="salesforce",
+        trello_card_id="card123",
+        classification=make_classification(
+            summary="Revisar reporte",
+            requested_action=requested_action,
+            category="salesforce",
+            needs_external_system=True,
+            external_systems=["salesforce"],
+        ),
+    )
+
+    result = app.reprocess_open_trello_tasks(apply=True)
+
+    assert result.processed == 1
+    assert result.changed == 0
+    assert fake_trello.updated_cards == []
+    assert fake_trello.created_cards == []
+    assert fake_trello.comments == []
+
+
+def test_reprocess_open_trello_does_not_call_slack_or_trello_to_slack_syncs(tmp_path):
+    fake_trello = FakeTrelloClient()
+    app = NoSlackSideEffectsAgentApp(
+        make_config(tmp_path, TRELLO_ENABLED="true", TRELLO_LIST_ID="list123"),
+        slack_client=FailingSlackClient(),
+        structured_model_factory=lambda schema: FakeStructuredModel([]),
+        trello_client=fake_trello,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_reprocess_candidate(app)
+
+    app.sync_trello_reply_commands = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no reply sync"))
+    app.sync_trello_waiting_requests = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no waiting sync"))
+    app.approve_reply = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no approve reply"))
+
+    result = app.reprocess_open_trello_tasks(apply=True)
+
+    assert result.errors == 0
+    assert result.slack_messages_sent == 0
+
+
 def test_trello_waiting_comment_sends_question_to_dm_and_dedupes(tmp_path):
     fake_slack = FakeSlackClient()
     fake_trello = FakeTrelloClient(
@@ -2463,6 +2735,46 @@ def test_trello_client_get_card_reads_due_complete_and_checklists(monkeypatch):
     )
 
 
+def test_trello_client_update_card_sends_name_and_desc(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_request(method, url, **kwargs):
+        calls.append({"method": method, "url": url, "json": kwargs.get("json"), "params": kwargs.get("params")})
+        if method == "PUT":
+            return FakeResponse({"ok": True})
+        return FakeResponse(
+            {
+                "id": "card123",
+                "name": "Nuevo nombre",
+                "url": "https://trello.com/c/card123",
+                "idList": "list123",
+                "closed": False,
+                "dueComplete": False,
+                "list": {"name": "Inbox"},
+                "checklists": [],
+            }
+        )
+
+    monkeypatch.setattr(trello_client.requests, "request", fake_request)
+
+    card = TrelloClient("key", "token").update_card("card123", name="Nuevo nombre", desc="Nueva desc")
+
+    assert calls[0]["method"] == "PUT"
+    assert calls[0]["url"].endswith("/cards/card123")
+    assert calls[0]["json"] == {"name": "Nuevo nombre", "desc": "Nueva desc"}
+    assert calls[1]["method"] == "GET"
+    assert card.name == "Nuevo nombre"
+
+
 def test_trello_client_get_card_comments_reads_comment_actions(monkeypatch):
     captured = {}
 
@@ -2987,6 +3299,24 @@ def test_main_parser_accepts_reprocess_message_command():
     assert args.fixture == "fixtures/micaela_salesforce_report.json"
     assert args.dry_run
     assert args.show_before_after
+
+
+def test_main_parser_accepts_reprocess_open_trello_command():
+    args = build_parser().parse_args(
+        [
+            "reprocess-open-trello",
+            "--dry-run",
+            "--limit",
+            "10",
+            "--only-salesforce",
+            "--only-trello-created",
+        ]
+    )
+    assert args.command == "reprocess-open-trello"
+    assert args.dry_run
+    assert args.limit == 10
+    assert args.only_salesforce
+    assert args.only_trello_created
 
 
 def test_transcribe_audio_path_uses_injected_transcriber(tmp_path):

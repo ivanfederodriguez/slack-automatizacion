@@ -134,6 +134,24 @@ class TrelloClient:
             url=payload["url"],
         )
 
+    def update_card(
+        self,
+        card_id: str,
+        *,
+        name: Optional[str] = None,
+        desc: Optional[str] = None,
+    ) -> TrelloCardState:
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if desc is not None:
+            body["desc"] = desc
+        if not body:
+            return self.get_card(card_id)
+
+        self._request("PUT", f"/cards/{card_id}", json_body=body)
+        return self.get_card(card_id)
+
     def get_card(self, card_id: str) -> TrelloCardState:
         payload = self._request(
             "GET",
