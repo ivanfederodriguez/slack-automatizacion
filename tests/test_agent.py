@@ -15,9 +15,11 @@ from slack_personal_agent import (
     AudioTranscriptFusion,
     NoSlackSideEffectsAgentApp,
     SlackClassification,
+    SlackIntentClassification,
     format_reprocess_open_trello_result,
     local_model_fit_hint,
     normalize_classification_with_rules,
+    normalize_task_classification,
     parse_snooze_until,
     starts_new_request,
     validate_trello_api_key_format,
@@ -85,6 +87,7 @@ class FakeSlackClient:
         self.reply_calls = []
         self.replies_lookup = {}
         self.post_calls = []
+        self.upload_calls = []
         self.post_error = post_error
 
     def users_info(self, user):
@@ -124,6 +127,10 @@ class FakeSlackClient:
         if self.post_error is not None:
             raise self.post_error
         return {"ok": True, "ts": "50.123456"}
+
+    def files_upload_v2(self, **kwargs):
+        self.upload_calls.append(kwargs)
+        return {"ok": True, "files": [{"id": "FREPORT"}]}
 
 
 class FakeTrelloClient:
@@ -490,6 +497,108 @@ def test_dm_actionable_creates_task(tmp_path):
     assert count_tasks(app.config.db_path) == 1
 
 
+def test_two_stage_classification_extracts_task_only_after_new_task_intent(tmp_path):
+    task_draft = make_classification(
+        summary="Comparar reporte con Salesforce",
+        requested_action="Comparar el reporte mensual con Salesforce y documentar diferencias.",
+        objective="Validar que el reporte mensual coincida con Salesforce.",
+        deliverable="Listado de diferencias encontradas y conclusión de validación.",
+        source_materials=["Reporte mensual", "Salesforce"],
+        scope_filters=["Registros incluidos en el reporte mensual"],
+        time_period="Mes informado en el reporte",
+        required_fields=["Monto", "Estado"],
+    )
+    fake_model = FakeStructuredModel(
+        [
+            SlackIntentClassification(intent="new_task", confidence=0.94, reason="Pedido operativo concreto."),
+            task_draft,
+        ]
+    )
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {"ts": "1.001", "text": "Compará el reporte mensual con Salesforce.", "user": "UOTHER"},
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    task = get_task(app.config.db_path)
+    assert len(fake_model.calls) == 2
+    assert "Decidí solo la intención" in fake_model.calls[0]
+    assert "El mensaje ya fue clasificado como una tarea nueva" in fake_model.calls[1]
+    assert task["intent"] == "new_task"
+    assert task["classification_confidence"] == 0.94
+    assert "Objetivo:" in task["execution_brief"]
+    assert "Entregable:" in task["execution_brief"]
+    assert "Campos requeridos:" in task["execution_brief"]
+
+
+def test_reply_only_stops_after_intent_stage_and_does_not_create_task(tmp_path):
+    fake_model = FakeStructuredModel(
+        [SlackIntentClassification(intent="reply_only", confidence=0.97, reason="Pregunta breve.")]
+    )
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {"ts": "1.002", "text": "¿Tenés el link del tablero?", "user": "UOTHER"},
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    row = get_processed_row(app.config.db_path)
+    assert len(fake_model.calls) == 1
+    assert row["intent"] == "reply_only"
+    assert row["review_needed"] == 0
+    assert count_tasks(app.config.db_path) == 0
+
+
+def test_low_confidence_intent_is_queued_for_review_without_task(tmp_path):
+    fake_model = FakeStructuredModel(
+        [
+            SlackIntentClassification(
+                intent="new_task",
+                confidence=0.58,
+                reason="Puede ser pedido o comentario.",
+            )
+        ]
+    )
+    app = AgentApp(
+        make_config(tmp_path, CLASSIFICATION_AUTO_CONFIDENCE="0.75"),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {"ts": "1.003", "text": "Esto quizá haya que verlo.", "user": "UOTHER"},
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    row = get_processed_row(app.config.db_path)
+    assert row["classification_status"] == "review_needed"
+    assert row["confidence"] == 0.58
+    assert row["review_needed"] == 1
+    assert count_tasks(app.config.db_path) == 0
+    brief = app.build_brief()
+    assert "Clasificaciones para revisar: 1" in brief
+    assert "Clasificaciones ambiguas" in brief
+    assert "new_task (58%)" in brief
+
+
 def test_salesforce_report_request_overrides_research_classification(tmp_path):
     message_text = (
         "Ivo, me armás un informe de altas 2026 por campaña principal/campaña de origen:\n"
@@ -566,7 +675,7 @@ def test_reprocess_message_dry_run_has_no_external_side_effects_and_shows_output
 
     assert result.task_created is True
     assert result.slack_post_calls == []
-    assert len(result.skipped_slack_posts) == 1
+    assert result.skipped_slack_posts == []
     assert result.trello_enabled is False
     assert "Clasificación del modelo" in output
     assert "Clasificación final" in output
@@ -629,6 +738,24 @@ def test_conceptual_donor_research_is_not_forced_to_salesforce():
     assert normalized.external_systems == []
 
 
+def test_vague_task_action_is_normalized_and_missing_deliverable_is_explicit():
+    classification = make_classification(
+        summary="Revisar inconsistencias del padrón",
+        requested_action="Ver esto",
+        objective="Identificar inconsistencias del padrón compartido",
+        deliverable="",
+        missing_information=[],
+    )
+
+    normalized = normalize_task_classification(
+        classification,
+        raw_text="¿Podés ver esto? Hay inconsistencias en el padrón.",
+    )
+
+    assert normalized.requested_action == "Identificar inconsistencias del padrón compartido."
+    assert "Confirmar el resultado o entregable esperado." in normalized.missing_information
+
+
 def test_starts_new_request_detects_separators():
     for text in [
         "y por otro lado, necesito otra base",
@@ -676,7 +803,7 @@ def test_new_dm_task_sends_automatic_ack_without_mention(tmp_path):
     fake_model = FakeStructuredModel([sample_classification()])
     fake_slack = FakeSlackClient()
     app = AgentApp(
-        make_config(tmp_path),
+        make_config(tmp_path, SLACK_INTAKE_FEEDBACK_ENABLED="true"),
         slack_client=fake_slack,
         structured_model_factory=lambda schema: fake_model,
         sleep_fn=lambda _: None,
@@ -701,11 +828,33 @@ def test_new_dm_task_sends_automatic_ack_without_mention(tmp_path):
     assert "<@UOTHER>" not in text
 
 
-def test_new_private_channel_task_ack_mentions_requester(tmp_path):
+def test_new_dm_task_does_not_send_intake_feedback_by_default(tmp_path):
     fake_model = FakeStructuredModel([sample_classification()])
     fake_slack = FakeSlackClient()
     app = AgentApp(
         make_config(tmp_path),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {"ts": "1.21", "text": "Revisás este reporte?", "user": "UOTHER"},
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    task = get_task(app.config.db_path)
+    assert task["acknowledged_at"] is None
+    assert fake_slack.post_calls == []
+
+
+def test_new_private_channel_task_ack_mentions_requester(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(tmp_path, SLACK_INTAKE_FEEDBACK_ENABLED="true"),
         slack_client=fake_slack,
         structured_model_factory=lambda schema: fake_model,
         sleep_fn=lambda _: None,
@@ -726,7 +875,7 @@ def test_new_group_dm_task_ack_mentions_requester(tmp_path):
     fake_model = FakeStructuredModel([sample_classification()])
     fake_slack = FakeSlackClient()
     app = AgentApp(
-        make_config(tmp_path),
+        make_config(tmp_path, SLACK_INTAKE_FEEDBACK_ENABLED="true"),
         slack_client=fake_slack,
         structured_model_factory=lambda schema: fake_model,
         sleep_fn=lambda _: None,
@@ -818,12 +967,13 @@ def test_send_task_acknowledgement_uses_audio_copy_when_audio_was_transcribed(tm
 
 
 def test_thread_context_updates_existing_task_without_duplicate_and_confirms(tmp_path):
-    fake_model = FakeStructuredModel([sample_classification()])
+    fake_model = FakeStructuredModel([sample_classification(), sample_classification()])
     fake_slack = FakeSlackClient()
     fake_trello = FakeTrelloClient()
     app = AgentApp(
         make_config(
             tmp_path,
+            SLACK_INTAKE_FEEDBACK_ENABLED="true",
             TRELLO_ENABLED="true",
             TRELLO_API_KEY="key",
             TRELLO_TOKEN="token",
@@ -864,7 +1014,7 @@ def test_thread_context_updates_existing_task_without_duplicate_and_confirms(tmp
         task = conn.execute("SELECT last_context_ack_at FROM tasks LIMIT 1").fetchone()
 
     assert count_tasks(app.config.db_path) == 1
-    assert len(fake_model.calls) == 1
+    assert len(fake_model.calls) == 2
     assert processed_context["classification_status"] == "context_added"
     assert task["last_context_ack_at"]
     assert "*Pedido actualizado:*" in fake_slack.post_calls[1]["text"]
@@ -875,10 +1025,14 @@ def test_thread_context_updates_existing_task_without_duplicate_and_confirms(tmp
 
 
 def test_consecutive_dm_messages_from_same_sender_group_into_one_task(tmp_path):
-    fake_model = FakeStructuredModel([sample_classification()])
+    fake_model = FakeStructuredModel([sample_classification(), sample_classification()])
     fake_slack = FakeSlackClient()
     app = AgentApp(
-        make_config(tmp_path, CASE_GROUPING_WINDOW_MINUTES="15"),
+        make_config(
+            tmp_path,
+            CASE_GROUPING_WINDOW_MINUTES="15",
+            SLACK_INTAKE_FEEDBACK_ENABLED="true",
+        ),
         slack_client=fake_slack,
         structured_model_factory=lambda schema: fake_model,
         sleep_fn=lambda _: None,
@@ -907,12 +1061,167 @@ def test_consecutive_dm_messages_from_same_sender_group_into_one_task(tmp_path):
         ).fetchall()
 
     assert count_tasks(app.config.db_path) == 1
-    assert len(fake_model.calls) == 1
+    assert len(fake_model.calls) == 2
     assert second_message["classification_status"] == "context_added"
     assert len(context_events) == 1
     assert "La versión buena" in context_events[0]["details_json"]
     assert "*Pedido actualizado:*" in fake_slack.post_calls[1]["text"]
     assert "Buenísimo, gracias. Lo sumo al pedido." in fake_slack.post_calls[1]["text"]
+
+
+def test_followup_status_question_is_attached_to_existing_task(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    fake_slack = FakeSlackClient()
+    app = AgentApp(
+        make_config(tmp_path, CASE_GROUPING_WINDOW_MINUTES="15"),
+        slack_client=fake_slack,
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    conversation = {"id": "D123", "is_im": True, "user": "UOTHER"}
+
+    app.process_message(
+        {"ts": "1.57", "text": "Revisás este reporte?", "user": "UOTHER"},
+        conversation,
+        my_user_id="UME",
+    )
+    app.process_message(
+        {"ts": "1.58", "text": "¿Cómo viene eso?", "user": "UOTHER"},
+        conversation,
+        my_user_id="UME",
+    )
+
+    with sqlite3.connect(app.config.db_path) as conn:
+        status = conn.execute(
+            "SELECT classification_status FROM processed_messages WHERE message_ts = '1.58'"
+        ).fetchone()[0]
+
+    assert count_tasks(app.config.db_path) == 1
+    assert len(fake_model.calls) == 1
+    assert status == "context_added"
+
+
+def test_semantic_followup_uses_structured_case_memory(tmp_path):
+    fake_model = FakeStructuredModel(
+        [
+            sample_classification(),
+            SlackIntentClassification(
+                intent="followup",
+                confidence=0.93,
+                related_task_id=1,
+                reason="Precisa un dato del caso abierto.",
+            ),
+        ]
+    )
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    conversation = {"id": "D123", "is_im": True, "user": "UOTHER"}
+
+    app.process_message(
+        {"ts": "1.581", "text": "Revisás este reporte?", "user": "UOTHER"},
+        conversation,
+        my_user_id="UME",
+    )
+    app.process_message(
+        {"ts": "1.582", "text": "La cifra definitiva es 42.", "user": "UOTHER"},
+        conversation,
+        my_user_id="UME",
+    )
+
+    with sqlite3.connect(app.config.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        processed = conn.execute(
+            "SELECT classification_status, intent FROM processed_messages WHERE message_ts = '1.582'"
+        ).fetchone()
+    assert count_tasks(app.config.db_path) == 1
+    assert processed["classification_status"] == "context_added"
+    assert processed["intent"] == "followup"
+    assert '"task_id": 1' in fake_model.calls[1]
+    assert "execution_brief" in fake_model.calls[1]
+
+
+def test_strong_context_regenerates_public_text_and_execution_brief(tmp_path):
+    revised = make_classification(
+        summary="Validar reporte de junio",
+        requested_action="Comparar la versión de junio del reporte con Salesforce.",
+        objective="Validar la versión correcta del reporte.",
+        deliverable="Reporte de junio validado con diferencias documentadas.",
+        source_materials=["Reporte de junio", "Salesforce"],
+        scope_filters=["Usar únicamente la versión de junio"],
+        time_period="Junio",
+        required_fields=["Monto", "Estado"],
+    )
+    fake_model = FakeStructuredModel([revised])
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+    insert_processed_for_task(app, message_ts="1.583", raw_text="Comparar el reporte con Salesforce.")
+    insert_task(
+        app,
+        created_at="2026-06-11T12:00:00+00:00",
+        message_ts="1.583",
+        summary="Comparar reporte",
+        public_request_text="Comparar el reporte con Salesforce.",
+        requested_action="Comparar el reporte con Salesforce.",
+        priority="medium",
+        category="salesforce",
+        classification=sample_classification(),
+    )
+    task_row = app.get_task_by_id(1)
+
+    app.add_context_to_task(
+        task_row,
+        message={
+            "ts": "1.584",
+            "text": "Usá únicamente la versión de junio e incluí monto y estado.",
+            "user": "UOTHER",
+        },
+        conversation={"id": "D123", "is_im": True, "user": "UOTHER"},
+        sender_label="Ana Gomez",
+        conversation_label="DM con Ana Gomez",
+    )
+
+    task = get_task(app.config.db_path)
+    assert task["summary"] == "Validar reporte de junio"
+    assert "versión de junio" in task["public_request_text"]
+    assert "Entregable:" in task["execution_brief"]
+    assert "Reporte de junio validado" in task["execution_brief"]
+    assert "Período:\n- Junio" in task["execution_brief"]
+    assert len(get_task_events(app.config.db_path, "task_brief_regenerated")) == 1
+
+
+def test_question_only_message_is_not_saved_as_task(tmp_path):
+    fake_model = FakeStructuredModel([sample_classification()])
+    app = AgentApp(
+        make_config(tmp_path),
+        slack_client=FakeSlackClient(),
+        structured_model_factory=lambda schema: fake_model,
+        sleep_fn=lambda _: None,
+    )
+    app.init_db()
+
+    app.process_message(
+        {"ts": "1.59", "text": "¿Tenés el link del tablero?", "user": "UOTHER"},
+        {"id": "D123", "is_im": True, "user": "UOTHER"},
+        my_user_id="UME",
+    )
+
+    row = get_processed_row(app.config.db_path)
+    payload = json.loads(row["classification_json"])
+    assert row["classification_status"] == "done"
+    assert payload["is_actionable"] is False
+    assert payload["needs_reply"] is True
+    assert count_tasks(app.config.db_path) == 0
 
 
 def test_recent_context_excludes_previous_day_without_thread(tmp_path):
@@ -1001,7 +1310,7 @@ def test_duplicate_thread_context_does_not_send_confirmation(tmp_path):
     assert processed_context["message_ts"] == "1.7"
     assert status == "context_duplicate"
     assert count_tasks(app.config.db_path) == 1
-    assert len(fake_slack.post_calls) == 1
+    assert fake_slack.post_calls == []
 
 
 def test_audio_disabled_does_not_change_flow(tmp_path):
@@ -1207,7 +1516,11 @@ def test_audio_in_existing_thread_adds_context_without_duplicate(tmp_path):
     fake_model = FakeStructuredModel([sample_classification()])
     fake_slack = FakeSlackClient()
     app = AgentApp(
-        make_config(tmp_path, LOCAL_WHISPER_ENABLED="false"),
+        make_config(
+            tmp_path,
+            LOCAL_WHISPER_ENABLED="false",
+            SLACK_INTAKE_FEEDBACK_ENABLED="true",
+        ),
         slack_client=fake_slack,
         structured_model_factory=lambda schema: fake_model,
         sleep_fn=lambda _: None,
@@ -2747,7 +3060,8 @@ def test_waiting_requester_reply_clears_waiting_and_adds_context(tmp_path):
     assert task["waiting_cleared_at"]
     assert any("Respuesta recibida desde Slack: Este es el link" in comment["text"] for comment in fake_trello.comments)
     assert len(get_task_events(app.config.db_path, "waiting_cleared")) == 1
-    assert "*Pedido actualizado:*" in fake_slack.post_calls[-1]["text"]
+    assert len(fake_slack.post_calls) == 1
+    assert "*Falta información:*" in fake_slack.post_calls[0]["text"]
 
 
 def test_trello_done_ignores_waiting_task_even_when_due_complete(tmp_path):
@@ -3484,7 +3798,7 @@ def test_slack_ack_failure_is_saved_without_breaking_processing(tmp_path):
     fake_model = FakeStructuredModel([sample_classification()])
     fake_slack = FakeSlackClient(post_error=RuntimeError("slack down"))
     app = AgentApp(
-        make_config(tmp_path),
+        make_config(tmp_path, SLACK_INTAKE_FEEDBACK_ENABLED="true"),
         slack_client=fake_slack,
         structured_model_factory=lambda schema: fake_model,
         sleep_fn=lambda _: None,
@@ -3565,6 +3879,21 @@ def test_config_defaults_to_local_provider_and_light_model(tmp_path):
     config = make_config(tmp_path)
     assert config.model_provider == "ollama"
     assert config.ollama_model == "qwen3:4b-instruct"
+    assert config.ollama_auth_token == ""
+    assert config.ollama_managed_locally is False
+    assert config.slack_intake_feedback_enabled is False
+
+
+def test_remote_ollama_settings_are_loaded_from_env(tmp_path):
+    config = make_config(
+        tmp_path,
+        OLLAMA_BASE_URL="https://remote.example/ollama",
+        OLLAMA_AUTH_TOKEN="secret-token",
+        OLLAMA_MANAGED_LOCALLY="true",
+    )
+    assert config.ollama_base_url == "https://remote.example/ollama"
+    assert config.ollama_auth_token == "secret-token"
+    assert config.ollama_managed_locally is True
 
 
 def test_groq_provider_can_be_selected(tmp_path):
@@ -4467,3 +4796,70 @@ def test_trello_reference_skips_card_creation(tmp_path):
     assert task["trello_status"] == "skipped"
     assert "ya referencia un recurso de Trello" in task["trello_last_error"]
     assert fake_trello.created_cards == []
+
+
+def test_salesforce_outbox_is_sent_once_to_original_thread(tmp_path):
+    fake_slack = FakeSlackClient()
+    app = AgentApp(make_config(tmp_path), slack_client=fake_slack, sleep_fn=lambda _: None)
+    app.init_db()
+    xlsx_path = tmp_path / "informe.xlsx"
+    xlsx_path.write_bytes(b"xlsx de prueba")
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(app.config.db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                created_at, channel_id, message_ts, user_id, sender_label,
+                conversation_label, summary, requested_action, priority,
+                category, status, classification_json, thread_ts, updated_at
+            ) VALUES (?, 'D123', '100.1', 'UOTHER', 'Ana', 'DM', 'Reporte',
+                      'Generar reporte', 'medium', 'salesforce', 'new', '{}',
+                      '100.1', ?)
+            """,
+            (now, now),
+        )
+        task_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+        connection.execute(
+            """
+            INSERT INTO automation_outbox(
+                event_key, task_id, producer, event_type, routing_channel,
+                payload_json, status, available_at, created_at, updated_at
+            ) VALUES (?, ?, 'salesforce', 'salesforce_completed', 'slack',
+                      ?, 'pending', ?, ?, ?)
+            """,
+            (
+                f"salesforce:{task_id}:1:completed",
+                task_id,
+                json.dumps(
+                    {
+                        "salesforce_report_url": (
+                            "https://techo.lightning.force.com/lightning/r/Report/"
+                            "00O000000000001/view"
+                        ),
+                        "xlsx_path": str(xlsx_path),
+                    }
+                ),
+                now,
+                now,
+                now,
+            ),
+        )
+
+    assert app.sync_automation_outbox(limit=10) == 1
+    assert app.sync_automation_outbox(limit=10) == 0
+    assert fake_slack.post_calls == []
+    assert len(fake_slack.upload_calls) == 1
+    assert fake_slack.upload_calls[0]["channel"] == "D123"
+    assert fake_slack.upload_calls[0]["thread_ts"] == "100.1"
+    assert fake_slack.upload_calls[0]["file"] == str(xlsx_path)
+    assert "Abrir informe en Salesforce" in fake_slack.upload_calls[0]["initial_comment"]
+
+    with sqlite3.connect(app.config.db_path) as connection:
+        outbox_status = connection.execute(
+            "SELECT status FROM automation_outbox"
+        ).fetchone()[0]
+        task_status = connection.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0]
+    assert outbox_status == "sent"
+    assert task_status == "responded"

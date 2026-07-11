@@ -34,7 +34,7 @@ El CLI ya cubre una v0 util para uso personal:
 
 - Python 3
 - un token de Slack valido en `SLACK_USER_TOKEN`
-- Ollama local o Groq, segun `MODEL_PROVIDER`
+- un endpoint de Ollama accesible o Groq, segun `MODEL_PROVIDER`
 - Trello opcional
 - Telegram opcional para aprobacion privada
 - `faster-whisper` instalado si `LOCAL_WHISPER_ENABLED=true`
@@ -79,6 +79,8 @@ MY_MENTION_ALIASES=ivan,ivo
 MODEL_PROVIDER=ollama
 OLLAMA_MODEL=qwen3:4b-instruct
 OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_AUTH_TOKEN=
+OLLAMA_MANAGED_LOCALLY=false
 
 # fallback opcional
 GROQ_API_KEY=
@@ -91,6 +93,8 @@ CASE_GROUPING_WINDOW_MINUTES=15
 CONTEXT_MAX_AGE_MINUTES=120
 LOCAL_TIMEZONE=America/Argentina/Cordoba
 SLACK_SEND_APPROVED_REPLIES=false
+SLACK_INTAKE_FEEDBACK_ENABLED=false
+CLASSIFICATION_AUTO_CONFIDENCE=0.75
 FINAL_REPLY_MODE=telegram_approval
 
 # Trello opcional
@@ -317,11 +321,13 @@ Para `upload`, el token de Slack necesita `files:read`. Si falla la descarga o l
 
 ## Worker de sync
 
-`install-autostart` instala tres LaunchAgents:
+`install-autostart` instala los LaunchAgents del agente y del sync. Si `OLLAMA_MANAGED_LOCALLY=true`,
+tambien instala uno para `ollama serve`; en modo remoto no levanta ningun proceso local de Ollama.
 
-- `com.ivanrodriguez.slack-agent.ollama`, que corre `runtime/run_ollama.sh`;
-- `com.ivanrodriguez.slack-agent.agent`, que espera a Ollama y corre `python main.py poll`;
+- `com.ivanrodriguez.slack-agent.agent`, que espera a que el endpoint de Ollama responda y corre `python main.py poll`;
 - `com.ivanrodriguez.slack-agent.sync`, que corre `runtime/run_sync_worker.sh`.
+
+El sync worker también consume `automation_outbox` de la base compartida. Los eventos `salesforce_completed` se publican una sola vez en el canal y thread originales y adjuntan los `.csv`/`.xlsx`; los eventos de aclaración permanecen retenidos sin canal hasta configurar el adaptador preferido.
 
 El worker de sync ejecuta en loop:
 

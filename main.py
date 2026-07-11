@@ -35,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
             "trello-reply-sync",
             "trello-waiting-sync",
             "trello-done-sync",
+            "automation-outbox-sync",
             "telegram-poll",
             "transcribe-audio",
             "transcribe-audio-folder",
@@ -44,6 +45,12 @@ def build_parser() -> argparse.ArgumentParser:
             "uninstall-autostart",
         ],
         help="Qué acción ejecutar.",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="Archivo de entorno explícito para aislar esta automatización.",
     )
     parser.add_argument(
         "task_id",
@@ -138,9 +145,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    load_dotenv()
     parser = build_parser()
     args = parser.parse_args()
+    load_dotenv(dotenv_path=args.env_file, override=False)
 
     try:
         if args.command in {"reprocess-message", "reprocess-open-trello"}:
@@ -208,6 +215,10 @@ def main() -> int:
     if args.command == "trello-done-sync":
         synced = app.sync_trello_done_tasks(limit=args.limit if args.limit is not None else 50)
         print(f"[green]Tareas cerradas o marcadas como done_pending_reply:[/green] {synced}")
+        return 0
+    if args.command == "automation-outbox-sync":
+        sent = app.sync_automation_outbox(limit=args.limit if args.limit is not None else 20)
+        print(f"[green]Eventos de automatización enviados por Slack:[/green] {sent}")
         return 0
     if args.command == "telegram-poll":
         handled = app.poll_telegram_updates(limit=args.limit if args.limit is not None else 20)

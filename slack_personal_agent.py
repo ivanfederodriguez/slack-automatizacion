@@ -23,6 +23,7 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from autostart import install_launch_agents, uninstall_launch_agents
+from automation_bridge import AutomationBridge, OutboxDelivery
 from audio_transcription import (
     AudioAttachment,
     AudioTranscriber,
@@ -49,6 +50,7 @@ DB_PATH = "slack_agent.db"
 DEFAULT_PROVIDER = "ollama"
 DEFAULT_OLLAMA_MODEL = "qwen3:4b-instruct"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_MANAGED_LOCALLY = False
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 MAX_MESSAGE_LINKS = 5
 MAX_PUBLIC_PREVIEW_BYTES = 65536
@@ -122,7 +124,18 @@ class TelegramClient:
         return list(payload.get("result") or [])
 
 
+class SlackIntentClassification(BaseModel):
+    intent: Literal["new_task", "followup", "reply_only", "fyi"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    review_needed: bool = False
+    related_task_id: Optional[int] = None
+    reason: str = ""
+
+
 class SlackClassification(BaseModel):
+    intent: Literal["new_task", "followup", "reply_only", "fyi"] = "new_task"
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    review_needed: bool = False
     is_actionable: bool = Field(description="Si el mensaje requiere acción de Ivan.")
     summary: str = Field(description="Resumen breve del mensaje.")
     requested_action: str = Field(description="Qué esperan que Ivan haga.")
@@ -142,6 +155,12 @@ class SlackClassification(BaseModel):
     needs_external_system: bool
     external_systems: list[str] = Field(default_factory=list)
     missing_information: list[str] = Field(default_factory=list)
+    objective: str = ""
+    deliverable: str = ""
+    source_materials: list[str] = Field(default_factory=list)
+    scope_filters: list[str] = Field(default_factory=list)
+    time_period: str = ""
+    required_fields: list[str] = Field(default_factory=list)
     suggested_next_step: str
     draft_reply: str
 
@@ -224,6 +243,8 @@ class AgentState(TypedDict, total=False):
     relevant: bool
     relevance_reason: str
     message_links: list[MessageLink]
+    intent_classification: Optional[SlackIntentClassification]
+    related_task_id: Optional[int]
     classification: Optional[SlackClassification]
 
 
@@ -390,9 +411,13 @@ class AgentConfig:
     model_provider: Literal["ollama", "groq"] = DEFAULT_PROVIDER
     ollama_model: str = DEFAULT_OLLAMA_MODEL
     ollama_base_url: str = DEFAULT_OLLAMA_BASE_URL
+    ollama_auth_token: str = ""
+    ollama_managed_locally: bool = DEFAULT_OLLAMA_MANAGED_LOCALLY
     groq_model: str = DEFAULT_GROQ_MODEL
     groq_api_key: str = ""
     slack_send_approved_replies: bool = False
+    slack_intake_feedback_enabled: bool = False
+    classification_auto_confidence: float = 0.75
     trello_enabled: bool = False
     trello_auto_create: bool = True
     trello_api_key: str = ""
@@ -437,6 +462,8 @@ class AgentConfig:
     sync_waiting_enabled: bool = True
     sync_trello_done_enabled: bool = True
     sync_telegram_poll_enabled: bool = True
+    automation_outbox_enabled: bool = True
+    automation_artifact_upload_enabled: bool = True
     db_path: str = DB_PATH
 
     @classmethod
@@ -446,6 +473,11 @@ class AgentConfig:
 
         slack_user_token = (get("SLACK_USER_TOKEN", "") or "").strip()
         if not slack_user_token:
+            if get("SOURCE_DB_PATH") or get("SALESFORCE_AUTH_MODE"):
+                raise ConfigError(
+                    "El archivo de entorno parece pertenecer a Salesforce; "
+                    "Slack requiere su configuración aislada y SLACK_USER_TOKEN."
+                )
             raise ConfigError("Falta SLACK_USER_TOKEN en el entorno o en .env.")
 
         model_provider = (get("MODEL_PROVIDER", DEFAULT_PROVIDER) or DEFAULT_PROVIDER).strip().lower()
@@ -455,6 +487,15 @@ class AgentConfig:
         trello_done_mode = (get("TRELLO_DONE_MODE", "check") or "check").strip().lower()
         if trello_done_mode not in {"check", "list", "checklist", "list_or_check"}:
             raise ConfigError("TRELLO_DONE_MODE debe ser check, list, checklist o list_or_check.")
+
+        try:
+            classification_auto_confidence = float(
+                get("CLASSIFICATION_AUTO_CONFIDENCE", "0.75") or "0.75"
+            )
+        except ValueError as exc:
+            raise ConfigError("CLASSIFICATION_AUTO_CONFIDENCE debe ser un número.") from exc
+        if not 0.0 <= classification_auto_confidence <= 1.0:
+            raise ConfigError("CLASSIFICATION_AUTO_CONFIDENCE debe estar entre 0 y 1.")
 
         final_reply_mode = (get("FINAL_REPLY_MODE", "telegram_approval") or "telegram_approval").strip().lower()
         if final_reply_mode not in {"telegram_approval", "slack_auto"}:
@@ -566,9 +607,18 @@ class AgentConfig:
             model_provider=model_provider,  # type: ignore[arg-type]
             ollama_model=(get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL) or DEFAULT_OLLAMA_MODEL).strip(),
             ollama_base_url=(get("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL) or DEFAULT_OLLAMA_BASE_URL).strip(),
+            ollama_auth_token=(get("OLLAMA_AUTH_TOKEN", "") or "").strip(),
+            ollama_managed_locally=parse_bool(
+                get("OLLAMA_MANAGED_LOCALLY", str(DEFAULT_OLLAMA_MANAGED_LOCALLY).lower())
+                or str(DEFAULT_OLLAMA_MANAGED_LOCALLY).lower()
+            ),
             groq_model=(get("GROQ_MODEL", DEFAULT_GROQ_MODEL) or DEFAULT_GROQ_MODEL).strip(),
             groq_api_key=(get("GROQ_API_KEY", "") or "").strip(),
             slack_send_approved_replies=parse_bool(get("SLACK_SEND_APPROVED_REPLIES", "false") or "false"),
+            slack_intake_feedback_enabled=parse_bool(
+                get("SLACK_INTAKE_FEEDBACK_ENABLED", "false") or "false"
+            ),
+            classification_auto_confidence=classification_auto_confidence,
             trello_enabled=parse_bool(get("TRELLO_ENABLED", "false") or "false"),
             trello_auto_create=parse_bool(get("TRELLO_AUTO_CREATE", "true") or "true"),
             trello_api_key=(get("TRELLO_API_KEY", "") or "").strip(),
@@ -627,7 +677,13 @@ class AgentConfig:
             sync_waiting_enabled=parse_bool(get("SYNC_WAITING_ENABLED", "true") or "true"),
             sync_trello_done_enabled=parse_bool(get("SYNC_TRELLO_DONE_ENABLED", "true") or "true"),
             sync_telegram_poll_enabled=parse_bool(get("SYNC_TELEGRAM_POLL_ENABLED", "true") or "true"),
-            db_path=(get("DB_PATH", DB_PATH) or DB_PATH).strip(),
+            automation_outbox_enabled=parse_bool(
+                get("AUTOMATION_OUTBOX_ENABLED", "true") or "true"
+            ),
+            automation_artifact_upload_enabled=parse_bool(
+                get("AUTOMATION_ARTIFACT_UPLOAD_ENABLED", "true") or "true"
+            ),
+            db_path=str(Path((get("DB_PATH", DB_PATH) or DB_PATH).strip()).expanduser()),
         )
 
 
@@ -736,6 +792,104 @@ NEW_REQUEST_STARTERS = (
     "nuevo pedido",
     "aparte",
 )
+FOLLOW_UP_STARTERS = (
+    "ademas",
+    "además",
+    "tambien",
+    "también",
+    "sumo",
+    "agrego",
+    "te paso",
+    "aca",
+    "acá",
+    "ahi",
+    "ahí",
+    "me olvide",
+    "me olvidé",
+    "por las dudas",
+    "el link",
+    "la captura",
+    "la version",
+    "la versión",
+    "eso",
+    "esto",
+    "lo de",
+    "sobre eso",
+    "sobre esto",
+    "con eso",
+    "con esto",
+)
+FOLLOW_UP_FRAGMENTS = (
+    "como viene",
+    "cómo viene",
+    "como va",
+    "cómo va",
+    "pudiste",
+    "pudiste ver",
+    "pudiste revisar",
+    "pudiste hacer",
+    "tenes idea",
+    "tenés idea",
+    "te sirve si",
+    "te suma si",
+    "suma si",
+    "sirve si",
+    "eso mismo",
+    "lo mismo",
+    "esta bien asi",
+    "está bien así",
+)
+WORK_REQUEST_TERMS = (
+    "revisa",
+    "revisa",
+    "revisar",
+    "mirar",
+    "validar",
+    "comparar",
+    "armar",
+    "preparar",
+    "generar",
+    "exportar",
+    "actualizar",
+    "consultar",
+    "chequear",
+    "controlar",
+    "corregir",
+    "resolver",
+    "hacer",
+    "avanzar",
+    "seguir",
+    "buscar",
+    "pasar",
+    "mandar",
+    "enviar",
+    "compartir",
+    "subir",
+    "bajar",
+    "cargar",
+    "abrir",
+    "cerrar",
+    "completar",
+)
+QUESTION_ONLY_STARTERS = (
+    "que ",
+    "qué ",
+    "como ",
+    "cómo ",
+    "cuando ",
+    "cuándo ",
+    "donde ",
+    "dónde ",
+    "por que ",
+    "por qué ",
+    "tenes ",
+    "tenés ",
+    "sabes ",
+    "sabés ",
+    "viste ",
+    "entendes ",
+    "entendés ",
+)
 
 
 def has_salesforce_url(message_links: list[MessageLink]) -> bool:
@@ -770,6 +924,64 @@ def starts_new_request(text: str) -> bool:
     if not normalized:
         return False
     return any(normalized.startswith(starter) for starter in NEW_REQUEST_STARTERS)
+
+
+def looks_like_followup_message(text: str) -> bool:
+    normalized = normalize_for_matching(text)
+    if not normalized:
+        return False
+    if any(normalized.startswith(starter) for starter in FOLLOW_UP_STARTERS):
+        return True
+    return any(fragment in normalized for fragment in FOLLOW_UP_FRAGMENTS)
+
+
+def looks_like_work_request(text: str) -> bool:
+    normalized = normalize_for_matching(text)
+    if not normalized:
+        return False
+    if has_salesforce_text_signal(text) or has_donor_data_request_signal(text):
+        return True
+    return any(term in normalized for term in WORK_REQUEST_TERMS)
+
+
+def looks_like_information_request(text: str) -> bool:
+    normalized = normalize_for_matching(text)
+    if not normalized:
+        return False
+    if "?" in text:
+        return True
+    return any(normalized.startswith(starter) for starter in QUESTION_ONLY_STARTERS)
+
+
+def looks_like_question_only_message(text: str) -> bool:
+    normalized = normalize_for_matching(text)
+    if not normalized or not looks_like_information_request(text):
+        return False
+    if looks_like_work_request(text):
+        return False
+    info_fragments = (
+        "tenes",
+        "tenés",
+        "sabes",
+        "sabés",
+        "como viene",
+        "cómo viene",
+        "como va",
+        "cómo va",
+        "cuando",
+        "cuándo",
+        "donde",
+        "dónde",
+        "por que",
+        "por qué",
+        "quien",
+        "quién",
+        "me confirmas",
+        "me confirmás",
+        "me decis",
+        "me decís",
+    )
+    return any(fragment in normalized for fragment in info_fragments)
 
 
 def improve_donor_data_requested_action(action: str, text: str) -> str:
@@ -879,6 +1091,135 @@ def normalize_classification_with_rules(
     )
 
 
+def refine_classification_for_conversation(
+    classification: SlackClassification,
+    *,
+    text: str,
+    context_text: str,
+) -> SlackClassification:
+    if starts_new_request(text):
+        return classification
+
+    if classification.is_actionable and looks_like_question_only_message(text):
+        update = {
+            "is_actionable": False,
+            "needs_reply": True,
+        }
+        if not clean_text(classification.suggested_next_step):
+            update["suggested_next_step"] = "Responder la consulta y decidir si hace falta una tarea aparte."
+        return classification.model_copy(update=update)
+
+    if (
+        classification.is_actionable
+        and looks_like_followup_message(text)
+        and not looks_like_work_request(text)
+        and context_text.strip()
+    ):
+        return classification.model_copy(
+            update={
+                "is_actionable": False,
+                "needs_reply": True,
+                "suggested_next_step": "Tomar este mensaje como seguimiento del tema ya abierto y responder si hace falta.",
+            }
+        )
+
+    return classification
+
+
+def classification_intent_from_task(classification: SlackClassification) -> SlackIntentClassification:
+    if classification.review_needed:
+        intent = classification.intent
+    elif classification.is_actionable:
+        intent = "new_task"
+    elif classification.needs_reply:
+        intent = "reply_only"
+    else:
+        intent = "fyi"
+    return SlackIntentClassification(
+        intent=intent,
+        confidence=classification.confidence,
+        review_needed=classification.review_needed,
+        reason=classification.summary,
+    )
+
+
+def classification_from_intent(intent: SlackIntentClassification) -> SlackClassification:
+    needs_reply = intent.intent in {"followup", "reply_only"}
+    return SlackClassification(
+        intent=intent.intent,
+        confidence=intent.confidence,
+        review_needed=intent.review_needed,
+        is_actionable=False,
+        summary=intent.reason or "Mensaje de Slack clasificado sin tarea nueva.",
+        requested_action="",
+        priority="low",
+        category="other",
+        needs_reply=needs_reply,
+        needs_external_system=False,
+        external_systems=[],
+        missing_information=[],
+        suggested_next_step=(
+            "Revisar manualmente la intención antes de crear una tarea."
+            if intent.review_needed
+            else "Responder si corresponde, sin crear una tarea nueva."
+        ),
+        draft_reply="",
+    )
+
+
+def normalize_vague_requested_action(classification: SlackClassification, raw_text: str) -> SlackClassification:
+    action = clean_text(classification.requested_action)
+    normalized = normalize_for_matching(action)
+    vague_action = bool(
+        re.fullmatch(
+            r"(?:ver|mirar|hacer|revisar|chequear|resolver)(?:\s+(?:esto|eso|el tema|la cosa|lo de ayer))?[.!?]*",
+            normalized,
+        )
+    )
+    if not vague_action:
+        return classification
+
+    objective = clean_text(classification.objective)
+    deliverable = clean_text(classification.deliverable)
+    summary = clean_text(classification.summary)
+    target = objective or summary or clean_text(raw_text)
+    if deliverable and normalize_for_matching(deliverable) not in normalize_for_matching(target):
+        improved = f"{target.rstrip('.')}. Entregar: {deliverable.rstrip('.')}."
+    else:
+        improved = target.rstrip(".") + "."
+
+    missing = coerce_string_list(classification.missing_information)
+    if not deliverable and not any("entregable" in normalize_for_matching(item) for item in missing):
+        missing.append("Confirmar el resultado o entregable esperado.")
+    return classification.model_copy(
+        update={
+            "requested_action": improved,
+            "objective": objective or improved,
+            "missing_information": missing,
+        }
+    )
+
+
+def normalize_task_classification(
+    classification: SlackClassification,
+    *,
+    raw_text: str,
+    confidence: Optional[float] = None,
+) -> SlackClassification:
+    update: dict[str, Any] = {
+        "intent": "new_task",
+        "is_actionable": True,
+        "review_needed": False,
+    }
+    if confidence is not None:
+        update["confidence"] = confidence
+    normalized = classification.model_copy(update=update)
+    normalized = normalize_vague_requested_action(normalized, raw_text)
+    if not clean_text(normalized.objective):
+        normalized = normalized.model_copy(update={"objective": normalized.requested_action})
+    return normalized
+
+
 def validate_trello_api_key_format(value: str) -> Optional[str]:
     key = value.strip()
     if not key:
@@ -921,6 +1262,7 @@ class AgentApp:
         self._public_preview_fetcher = public_preview_fetcher or self.fetch_public_url_preview
         self._input = input_fn
         self._open_url = open_url_fn
+        self._intent_classifier: Optional[StructuredModel] = None
         self._classifier: Optional[StructuredModel] = None
         self._audio_fusion_model: Optional[StructuredModel] = None
         self._graph = None
@@ -928,8 +1270,10 @@ class AgentApp:
         self._sleep = sleep_fn
 
     def db_connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.config.db_path)
+        conn = sqlite3.connect(self.config.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 10000")
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def init_db(self) -> None:
@@ -1084,6 +1428,9 @@ class AgentApp:
             )
             self._ensure_column(conn, "processed_messages", "classification_error", "classification_error TEXT")
             self._ensure_column(conn, "processed_messages", "context_text", "context_text TEXT")
+            self._ensure_column(conn, "processed_messages", "intent", "intent TEXT")
+            self._ensure_column(conn, "processed_messages", "confidence", "confidence REAL")
+            self._ensure_column(conn, "processed_messages", "review_needed", "review_needed INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "tasks", "trello_status", "trello_status TEXT NOT NULL DEFAULT 'pending'")
             self._ensure_column(conn, "tasks", "trello_card_id", "trello_card_id TEXT")
             self._ensure_column(conn, "tasks", "trello_card_url", "trello_card_url TEXT")
@@ -1110,6 +1457,10 @@ class AgentApp:
             self._ensure_column(conn, "tasks", "telegram_notified_at", "telegram_notified_at TEXT")
             self._ensure_column(conn, "tasks", "telegram_error", "telegram_error TEXT")
             self._ensure_column(conn, "tasks", "public_request_text", "public_request_text TEXT")
+            self._ensure_column(conn, "tasks", "execution_brief", "execution_brief TEXT")
+            self._ensure_column(conn, "tasks", "intent", "intent TEXT NOT NULL DEFAULT 'new_task'")
+            self._ensure_column(conn, "tasks", "classification_confidence", "classification_confidence REAL NOT NULL DEFAULT 1.0")
+            self._ensure_column(conn, "tasks", "review_needed", "review_needed INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "tasks", "has_audio_transcript", "has_audio_transcript INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "tasks", "waiting_requested_at", "waiting_requested_at TEXT")
             self._ensure_column(conn, "tasks", "waiting_request_text", "waiting_request_text TEXT")
@@ -1151,6 +1502,13 @@ class AgentApp:
                 UPDATE tasks
                 SET public_request_text = COALESCE(public_request_text, summary)
                 WHERE public_request_text IS NULL OR public_request_text = ''
+                """
+            )
+            conn.execute(
+                """
+                UPDATE tasks
+                SET intent = 'new_task'
+                WHERE intent IS NULL OR intent = ''
                 """
             )
             conn.execute(
@@ -1250,6 +1608,94 @@ class AgentApp:
                 ON tasks(trello_card_id)
                 """
             )
+        AutomationBridge(self.config.db_path).initialize()
+
+    def automation_delivery_text(self, delivery: OutboxDelivery) -> str:
+        if delivery.event_type == "salesforce_summary_ready":
+            return str(
+                delivery.payload.get("message")
+                or "El informe de Salesforce ya fue generado y espera aprobación."
+            )
+        report_url = str(delivery.payload.get("salesforce_report_url") or "").strip()
+        if not report_url.startswith("https://") or "/Report/" not in report_url:
+            raise ValueError(
+                "La entrega de Salesforce no contiene un enlace web válido al Report."
+            )
+        return f"*Informe de Salesforce listo*\n<{report_url}|Abrir informe en Salesforce>"
+
+    def upload_automation_artifacts(
+        self,
+        delivery: OutboxDelivery,
+        *,
+        initial_comment: str,
+    ) -> str:
+        if not self.config.automation_artifact_upload_enabled:
+            raise RuntimeError(
+                "La carga del XLSX de Salesforce está deshabilitada en la configuración."
+            )
+        raw_path = str(delivery.payload.get("xlsx_path") or "").strip()
+        path = Path(raw_path).expanduser()
+        if path.suffix.lower() != ".xlsx" or not path.is_file():
+            raise FileNotFoundError(
+                "La entrega de Salesforce no contiene un único archivo XLSX válido."
+            )
+        response = self.slack_call(
+            self.slack.files_upload_v2,
+            channel=delivery.channel_id,
+            thread_ts=delivery.thread_ts,
+            file=str(path),
+            title=path.name,
+            initial_comment=initial_comment,
+        )
+        files = response.get("files") if isinstance(response, dict) else None
+        first_file = files[0] if isinstance(files, list) and files else {}
+        return str(first_file.get("id") or response.get("file_id") or "uploaded")
+
+    def sync_automation_outbox(self, limit: int = 20) -> int:
+        if not self.config.automation_outbox_enabled:
+            return 0
+        self.init_db()
+        bridge = AutomationBridge(self.config.db_path)
+        sent = 0
+        for _ in range(limit):
+            delivery = bridge.claim_next()
+            if delivery is None:
+                break
+            try:
+                text = self.automation_delivery_text(delivery)
+                if delivery.event_type == "salesforce_completed":
+                    external_id = self.upload_automation_artifacts(
+                        delivery,
+                        initial_comment=text,
+                    )
+                else:
+                    response = self.slack_call(
+                        self.slack.chat_postMessage,
+                        channel=delivery.channel_id,
+                        thread_ts=delivery.thread_ts,
+                        text=text,
+                        client_msg_id=delivery.client_msg_id,
+                        unfurl_links=False,
+                        unfurl_media=False,
+                    )
+                    external_id = str(response.get("ts") or "")
+                bridge.mark_sent(delivery, external_id)
+                self.record_task_event(
+                    delivery.task_id,
+                    "automation_outbox_sent",
+                    {
+                        "event_key": delivery.event_key,
+                        "event_type": delivery.event_type,
+                        "external_id": external_id,
+                    },
+                )
+                sent += 1
+            except Exception as exc:
+                bridge.mark_failed(delivery, str(exc))
+                print(
+                    f"[yellow]No pude entregar evento {delivery.event_key} por Slack: {exc}[/yellow]"
+                )
+        return sent
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column_name: str, definition: str) -> None:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -1361,6 +1807,11 @@ class AgentApp:
                 model=self.config.ollama_model,
                 base_url=self.config.ollama_base_url,
                 temperature=0,
+                client_kwargs=(
+                    {"headers": {"Authorization": f"Bearer {self.config.ollama_auth_token}"}}
+                    if self.config.ollama_auth_token
+                    else {}
+                ),
             )
             return model.with_structured_output(schema)
 
@@ -1385,6 +1836,11 @@ class AgentApp:
         if self._classifier is None:
             self._classifier = self._structured_model_factory(SlackClassification)
         return self._classifier
+
+    def get_intent_classifier(self) -> StructuredModel:
+        if self._intent_classifier is None:
+            self._intent_classifier = self._structured_model_factory(SlackIntentClassification)
+        return self._intent_classifier
 
     def get_audio_fusion_model(self) -> StructuredModel:
         if self._audio_fusion_model is None:
@@ -2148,20 +2604,28 @@ Reglas:
         channel_id: str,
         message_ts: str,
         classification: SlackClassification,
+        status: str = "done",
     ) -> None:
         with self.db_connect() as conn:
             conn.execute(
                 """
                 UPDATE processed_messages
                 SET updated_at = ?,
-                    classification_status = 'done',
+                    classification_status = ?,
                     classification_json = ?,
+                    intent = ?,
+                    confidence = ?,
+                    review_needed = ?,
                     classification_error = NULL
                 WHERE channel_id = ? AND message_ts = ?
                 """,
                 (
                     now_iso(),
+                    status,
                     json.dumps(classification.model_dump(), ensure_ascii=False),
+                    classification.intent,
+                    classification.confidence,
+                    int(classification.review_needed),
                     channel_id,
                     message_ts,
                 ),
@@ -2217,15 +2681,19 @@ Reglas:
                     conversation_label,
                     summary,
                     public_request_text,
+                    execution_brief,
                     requested_action,
                     has_audio_transcript,
                     priority,
                     category,
                     status,
                     trello_status,
+                    intent,
+                    classification_confidence,
+                    review_needed,
                     classification_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     timestamp,
@@ -2251,12 +2719,19 @@ Reglas:
                         },
                         transcribed_audio=False,
                     ),
+                    self.build_execution_brief(
+                        classification=classification,
+                        raw_text=raw_text,
+                    ),
                     classification.requested_action,
                     int(has_audio_transcript),
                     classification.priority,
                     classification.category,
                     "new",
                     "pending",
+                    classification.intent,
+                    classification.confidence,
+                    int(classification.review_needed),
                     json.dumps(classification.model_dump(), ensure_ascii=False),
                 ),
             )
@@ -2277,6 +2752,9 @@ Reglas:
                 SET updated_at = ?,
                     classification_status = ?,
                     relevance_reason = ?,
+                    intent = 'followup',
+                    confidence = 1.0,
+                    review_needed = 0,
                     classification_error = NULL
                 WHERE channel_id = ? AND message_ts = ?
                 """,
@@ -2625,6 +3103,42 @@ Reglas:
             public_text = "Pedido recibido."
 
         return public_text
+
+    def build_execution_brief(
+        self,
+        *,
+        classification: SlackClassification | dict[str, Any],
+        raw_text: str = "",
+    ) -> str:
+        payload = (
+            classification.model_dump()
+            if isinstance(classification, SlackClassification)
+            else dict(classification)
+        )
+        objective = clean_text(payload.get("objective") or payload.get("requested_action") or "")
+        deliverable = clean_text(payload.get("deliverable") or "")
+        systems = self.classification_external_systems(payload)
+        materials = coerce_string_list(payload.get("source_materials"))
+        sources = [*systems, *materials]
+        scope_filters = coerce_string_list(payload.get("scope_filters"))
+        required_fields = coerce_string_list(payload.get("required_fields"))
+        missing = coerce_string_list(payload.get("missing_information"))
+        period = clean_text(payload.get("time_period") or "")
+
+        def block(title: str, values: list[str], fallback: str) -> str:
+            return "\n".join([f"{title}:", *([f"- {value}" for value in values] or [f"- {fallback}"])])
+
+        return "\n\n".join(
+            [
+                block("Objetivo", [objective] if objective else [], "No especificado; requiere revisión."),
+                block("Entregable", [deliverable] if deliverable else [], "No especificado."),
+                block("Fuente/sistema", sources, "No especificado."),
+                block("Alcance y filtros", scope_filters, "Sin filtros explícitos."),
+                block("Período", [period] if period else [], "No especificado."),
+                block("Campos requeridos", required_fields, "No especificados."),
+                block("Información faltante", missing, "No se detectó información faltante."),
+            ]
+        ).strip()
 
     def mark_task_acknowledged(self, task_id: int) -> None:
         with self.db_connect() as conn:
@@ -3004,6 +3518,172 @@ Reglas:
 
         self.record_task_event(task_row["id"], "trello_context_added", {"card_id": card_id})
 
+    def message_has_strong_task_context(self, text: str, links: list[MessageLink]) -> bool:
+        normalized = normalize_for_matching(text)
+        if not normalized or looks_like_question_only_message(text):
+            return False
+        detail_terms = (
+            "periodo",
+            "fecha",
+            "desde",
+            "hasta",
+            "campo",
+            "filtro",
+            "segmento",
+            "campana",
+            "fuente",
+            "reporte",
+            "archivo",
+            "version",
+            "formato",
+            "incluir",
+            "excluir",
+            "usar",
+        )
+        return bool(links or looks_like_work_request(text) or any(term in normalized for term in detail_terms))
+
+    def build_task_regeneration_prompt(
+        self,
+        *,
+        task_row: sqlite3.Row,
+        new_text: str,
+        context_text: str,
+    ) -> str:
+        current = self.classification_model_from_task_row(task_row).model_dump()
+        additions = self.task_context_additions_text(task_row["id"], limit=12)
+        return f"""
+Actualizá la redacción de una tarea existente usando contexto nuevo de Slack.
+
+Clasificación actual:
+{json.dumps(current, ensure_ascii=False, indent=2)}
+
+Pedido original:
+{row_value(task_row, "raw_text", "") or row_value(task_row, "public_request_text", "")}
+
+Contexto conversacional:
+{context_text or "Sin contexto adicional."}
+
+Actualizaciones acumuladas:
+{additions or "Sin actualizaciones previas."}
+
+Nuevo mensaje:
+{new_text}
+
+Reglas:
+- Conservá el mismo caso; intent=new_task e is_actionable=true describen la tarea consolidada.
+- Incorporá solamente datos que cambian o precisan objetivo, entregable, fuente, filtros, período o campos.
+- No conviertas preguntas de estado ni saludos en requisitos.
+- summary debe ser un título operativo breve en infinitivo.
+- requested_action, objective y deliverable deben ser concretos y ejecutables.
+- Mantené source_materials, scope_filters, time_period, required_fields y missing_information actualizados.
+- No inventes datos ausentes.
+""".strip()
+
+    def regenerate_task_brief_from_context(
+        self,
+        task_row: sqlite3.Row,
+        *,
+        new_text: str,
+        context_text: str,
+        links: list[MessageLink],
+    ) -> bool:
+        try:
+            result = self.get_classifier().invoke(
+                self.build_task_regeneration_prompt(
+                    task_row=task_row,
+                    new_text=new_text,
+                    context_text=context_text,
+                )
+            )
+            classification = (
+                result
+                if isinstance(result, SlackClassification)
+                else SlackClassification.model_validate(result)
+            )
+            classification = normalize_classification_with_rules(
+                classification,
+                text="\n".join(
+                    part
+                    for part in (row_value(task_row, "raw_text", "") or "", new_text)
+                    if part
+                ),
+                message_links=links,
+            )
+            old_classification = self.classification_model_from_task_row(task_row)
+            classification = normalize_task_classification(
+                classification,
+                raw_text=new_text,
+                confidence=old_classification.confidence,
+            )
+            merged_source = "\n".join(
+                part
+                for part in (
+                    row_value(task_row, "raw_text", "") or "",
+                    self.task_context_additions_text(task_row["id"], limit=12),
+                )
+                if part
+            )
+            updated_row = dict(task_row)
+            updated_row.update(
+                {
+                    "classification_json": json.dumps(classification.model_dump(), ensure_ascii=False),
+                    "summary": classification.summary,
+                    "requested_action": classification.requested_action,
+                    "priority": classification.priority,
+                    "category": classification.category,
+                    "raw_text": merged_source,
+                }
+            )
+            public_request_text = self.build_public_request_text(task_row=updated_row)
+            execution_brief = self.build_execution_brief(
+                classification=classification,
+                raw_text=merged_source,
+            )
+            with self.db_connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET summary = ?,
+                        requested_action = ?,
+                        public_request_text = ?,
+                        execution_brief = ?,
+                        priority = ?,
+                        category = ?,
+                        intent = ?,
+                        classification_confidence = ?,
+                        review_needed = 0,
+                        classification_json = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        classification.summary,
+                        classification.requested_action,
+                        public_request_text,
+                        execution_brief,
+                        classification.priority,
+                        classification.category,
+                        classification.intent,
+                        classification.confidence,
+                        json.dumps(classification.model_dump(), ensure_ascii=False),
+                        now_iso(),
+                        task_row["id"],
+                    ),
+                )
+            self.record_task_event(
+                task_row["id"],
+                "task_brief_regenerated",
+                {"message": new_text, "execution_brief": execution_brief},
+            )
+            return True
+        except Exception as exc:
+            self.record_task_event(
+                task_row["id"],
+                "task_brief_regeneration_failed",
+                {"message": new_text, "error": str(exc)[:1000]},
+            )
+            return False
+
     def add_context_to_task(
         self,
         task_row: sqlite3.Row,
@@ -3058,21 +3738,12 @@ Reglas:
                 """
                 UPDATE tasks
                 SET updated_at = ?,
-                    public_request_text = ?,
                     status = CASE WHEN status = 'snoozed' THEN 'new' ELSE status END,
                     snoozed_until = CASE WHEN status = 'snoozed' THEN NULL ELSE snoozed_until END
                 WHERE id = ?
                 """,
                 (
                     now_iso(),
-                    (
-                        self.build_public_request_text(
-                            task_row=task_row,
-                            transcribed_audio=bool(message.get("_audio_transcript_added")),
-                        )
-                        if text
-                        else task_row["public_request_text"]
-                    ),
                     task_row["id"],
                 ),
             )
@@ -3088,6 +3759,33 @@ Reglas:
                 "visual_file_ids": [attachment.file_id for attachment in visual_attachments],
             },
         )
+        brief_regenerated = bool(
+            text
+            and self.message_has_strong_task_context(text, links)
+            and self.regenerate_task_brief_from_context(
+                task_row,
+                new_text=text,
+                context_text=context_text,
+                links=links,
+            )
+        )
+        if brief_regenerated and task_row["trello_card_id"]:
+            refreshed_row = self.get_task_by_id(task_row["id"])
+            if refreshed_row:
+                try:
+                    name, description = self.build_trello_card_payload(refreshed_row)
+                    self.get_trello_client().update_card(
+                        task_row["trello_card_id"],
+                        name=name,
+                        desc=description,
+                    )
+                    self.record_task_event(
+                        task_row["id"],
+                        "trello_brief_updated",
+                        {"card_id": task_row["trello_card_id"]},
+                    )
+                except Exception as exc:
+                    self.mark_task_trello_context_failed(task_row["id"], str(exc))
         if text:
             self.add_context_to_trello_card(task_row, text, sender_label)
         if task_row["trello_card_id"]:
@@ -3098,7 +3796,7 @@ Reglas:
             status="context_added",
             reason=f"Contexto agregado a tarea #{task_row['id']}.",
         )
-        if text:
+        if text and self.should_send_intake_feedback():
             self.send_context_acknowledgement(
                 task_row["id"],
                 text,
@@ -3450,6 +4148,12 @@ Reglas:
             return False
         return self.is_same_local_day(current_dt, previous_dt)
 
+    def case_lookup_window_minutes(self) -> int:
+        return max(self.config.case_grouping_window_minutes, self.config.context_max_age_minutes)
+
+    def should_send_intake_feedback(self) -> bool:
+        return self.config.slack_intake_feedback_enabled
+
     def find_existing_case_for_message(
         self,
         message: dict[str, Any],
@@ -3496,10 +4200,13 @@ Reglas:
 
             recent_cutoff = (
                 datetime.now(timezone.utc)
-                - timedelta(minutes=self.config.case_grouping_window_minutes)
+                - timedelta(minutes=self.case_lookup_window_minutes())
             ).isoformat()
-            if self.is_direct_message_conversation(conversation) and requester_user_id:
-                recent_row = conn.execute(
+            followup_hint = looks_like_followup_message(message.get("text", "")) or looks_like_question_only_message(
+                message.get("text", "")
+            )
+            if self.is_direct_message_conversation(conversation) and requester_user_id and followup_hint:
+                recent_candidates = conn.execute(
                     f"""
                     SELECT tasks.*,
                            processed_messages.raw_text,
@@ -3513,21 +4220,25 @@ Reglas:
                       AND COALESCE(tasks.updated_at, tasks.created_at) >= ?
                       AND COALESCE(tasks.requester_user_id, tasks.user_id, '') = ?
                     ORDER BY COALESCE(tasks.updated_at, tasks.created_at) DESC, tasks.id DESC
-                    LIMIT 1
+                    LIMIT 2
                     """,
                     (channel_id, *statuses, recent_cutoff, requester_user_id),
-                ).fetchone()
+                ).fetchall()
+                recent_row = recent_candidates[0] if len(recent_candidates) == 1 else None
                 if (
                     recent_row
                     and recent_row["message_ts"] != message.get("ts")
-                    and self.is_message_within_grouping_window(
-                        str(message.get("ts") or ""),
-                        str(recent_row["message_ts"] or ""),
+                    and (
+                        self.is_message_within_grouping_window(
+                            str(message.get("ts") or ""),
+                            str(recent_row["message_ts"] or ""),
+                        )
+                        or followup_hint
                     )
                 ):
                     return recent_row
 
-            if not self.looks_like_context_message(message.get("text", "")):
+            if not self.looks_like_context_message(message.get("text", "")) and not followup_hint:
                 return None
 
             recent_rows = conn.execute(
@@ -3556,9 +4267,12 @@ Reglas:
             row
             for row in recent_rows
             if row["message_ts"] != message.get("ts")
-            and self.is_message_within_grouping_window(
-                str(message.get("ts") or ""),
-                str(row["message_ts"] or ""),
+            and (
+                self.is_message_within_grouping_window(
+                    str(message.get("ts") or ""),
+                    str(row["message_ts"] or ""),
+                )
+                or followup_hint
             )
         ]
         if len(eligible_rows) == 1:
@@ -3569,22 +4283,9 @@ Reglas:
         normalized = normalize_for_matching(text)
         if not normalized:
             return False
-        starters = (
-            "ademas",
-            "tambien",
-            "contexto",
-            "dato",
-            "detalle",
-            "sumo",
-            "agrego",
-            "te paso",
-            "aca",
-            "ahi",
-            "me olvide",
-            "por las dudas",
-            "el link",
-            "la captura",
-        )
+        if looks_like_followup_message(text):
+            return True
+        starters = ("contexto", "dato", "detalle")
         return normalized.startswith(starters) or "http://" in normalized or "https://" in normalized
 
     def get_task_row(self, channel_id: str, message_ts: str) -> Optional[sqlite3.Row]:
@@ -3645,6 +4346,10 @@ Reglas:
     def build_trello_card_payload(self, task_row: sqlite3.Row) -> tuple[str, str]:
         summary = row_value(task_row, "summary", "") or "Nueva tarea desde Slack"
         action = row_value(task_row, "public_request_text", "") or row_value(task_row, "requested_action", "") or "Sin acción especificada"
+        execution_brief = row_value(task_row, "execution_brief", "") or self.build_execution_brief(
+            classification=self.classification_from_task_row(task_row),
+            raw_text=row_value(task_row, "raw_text", "") or "",
+        )
         raw_text = row_value(task_row, "raw_text", "") or ""
         context_text = row_value(task_row, "context_text", "") or ""
         task_id = int(row_value(task_row, "id", 0) or 0)
@@ -3661,6 +4366,9 @@ Reglas:
                 f"Categoría: {row_value(task_row, 'category', '')}",
                 "",
                 f"Acción pedida: {action}",
+                "",
+                "Brief de ejecución:",
+                execution_brief,
                 "",
                 "Mensaje original:",
                 raw_text or "(sin texto)",
@@ -3863,6 +4571,9 @@ Reglas:
         if category not in allowed_categories:
             category = "other"
         fallback = {
+            "intent": payload.get("intent") or row_value(task_row, "intent", "") or "new_task",
+            "confidence": payload.get("confidence", row_value(task_row, "classification_confidence", 1.0) or 1.0),
+            "review_needed": bool(payload.get("review_needed", row_value(task_row, "review_needed", 0))),
             "is_actionable": True,
             "summary": row_value(task_row, "summary", "") or "Tarea desde Slack",
             "requested_action": row_value(task_row, "requested_action", "") or "Revisar tarea.",
@@ -3872,6 +4583,12 @@ Reglas:
             "needs_external_system": bool(payload.get("needs_external_system", False)),
             "external_systems": coerce_string_list(payload.get("external_systems")),
             "missing_information": coerce_string_list(payload.get("missing_information")),
+            "objective": payload.get("objective") or "",
+            "deliverable": payload.get("deliverable") or "",
+            "source_materials": coerce_string_list(payload.get("source_materials")),
+            "scope_filters": coerce_string_list(payload.get("scope_filters")),
+            "time_period": payload.get("time_period") or "",
+            "required_fields": coerce_string_list(payload.get("required_fields")),
             "suggested_next_step": payload.get("suggested_next_step") or "",
             "draft_reply": payload.get("draft_reply") or "",
         }
@@ -3888,7 +4605,14 @@ Reglas:
         updated["category"] = classification.category
         updated["priority"] = classification.priority
         updated["requested_action"] = classification.requested_action
+        updated["intent"] = classification.intent
+        updated["classification_confidence"] = classification.confidence
+        updated["review_needed"] = int(classification.review_needed)
         updated["classification_json"] = json.dumps(classification.model_dump(), ensure_ascii=False)
+        updated["execution_brief"] = self.build_execution_brief(
+            classification=classification,
+            raw_text=row_value(task_row, "raw_text", "") or "",
+        )
         if public_request_text:
             updated["public_request_text"] = public_request_text
         return updated
@@ -3981,6 +4705,10 @@ Reglas:
                     priority = ?,
                     requested_action = ?,
                     public_request_text = ?,
+                    execution_brief = ?,
+                    intent = ?,
+                    classification_confidence = ?,
+                    review_needed = ?,
                     classification_json = ?,
                     updated_at = ?
                 WHERE id = ?
@@ -3990,6 +4718,13 @@ Reglas:
                     new_classification.priority,
                     new_classification.requested_action,
                     new_public_request_text,
+                    self.build_execution_brief(
+                        classification=new_classification,
+                        raw_text=row_value(task_row, "raw_text", "") or "",
+                    ),
+                    new_classification.intent,
+                    new_classification.confidence,
+                    int(new_classification.review_needed),
                     json.dumps(new_classification.model_dump(), ensure_ascii=False),
                     timestamp,
                     task_row["id"],
@@ -4636,6 +5371,237 @@ Reglas:
             lines.append(f"- {self.user_label(message.get('user'))}: {text}")
         return "\n".join(lines)
 
+    def fetch_recent_open_task_context(
+        self,
+        *,
+        channel_id: str,
+        requester_user_id: str,
+        before_ts: str,
+        limit: int = 2,
+    ) -> str:
+        if not requester_user_id:
+            return ""
+
+        statuses = self.open_task_statuses_sql()
+        placeholders = ", ".join("?" for _ in statuses)
+        recent_cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=self.case_lookup_window_minutes())
+        ).isoformat()
+        with self.db_connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT tasks.id,
+                       tasks.summary,
+                       tasks.public_request_text,
+                       tasks.requested_action,
+                       COALESCE(tasks.updated_at, tasks.created_at) AS touched_at
+                FROM tasks
+                WHERE tasks.channel_id = ?
+                  AND COALESCE(tasks.status, 'new') IN ({placeholders})
+                  AND COALESCE(tasks.updated_at, tasks.created_at) >= ?
+                  AND COALESCE(tasks.requester_user_id, tasks.user_id, '') = ?
+                  AND tasks.message_ts != ?
+                ORDER BY touched_at DESC, tasks.id DESC
+                LIMIT ?
+                """,
+                (channel_id, *statuses, recent_cutoff, requester_user_id, before_ts, limit),
+            ).fetchall()
+
+        lines = []
+        for row in rows:
+            summary = clean_text(row["summary"] or "")
+            action = clean_text(row["public_request_text"] or row["requested_action"] or "")
+            detail = action or summary
+            if detail:
+                lines.append(f"- Caso abierto #{row['id']}: {compact_text(detail, 220)}")
+        return "\n".join(lines)
+
+    def build_message_context(
+        self,
+        *,
+        message: dict[str, Any],
+        conversation: dict[str, Any],
+    ) -> str:
+        if starts_new_request(message.get("text", "")):
+            return ""
+
+        parts: list[str] = []
+        recent_context = self.fetch_recent_context(
+            conversation["id"],
+            message["ts"],
+            thread_ts=message.get("thread_ts"),
+        )
+        if recent_context:
+            parts.append(recent_context)
+
+        if not message.get("thread_ts") and (
+            looks_like_followup_message(message.get("text", ""))
+            or looks_like_question_only_message(message.get("text", ""))
+        ):
+            related_tasks = self.fetch_recent_open_task_context(
+                channel_id=conversation["id"],
+                requester_user_id=str(message.get("user") or ""),
+                before_ts=str(message.get("ts") or ""),
+            )
+            if related_tasks:
+                parts.append("Casos abiertos recientes del mismo remitente:\n" + related_tasks)
+
+        return "\n\n".join(part for part in parts if part)
+
+    def fetch_structured_case_memory(
+        self,
+        *,
+        channel_id: str,
+        requester_user_id: str,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        statuses = self.open_task_statuses_sql()
+        placeholders = ", ".join("?" for _ in statuses)
+        recent_cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=self.case_lookup_window_minutes())
+        ).isoformat()
+        with self.db_connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT tasks.*
+                FROM tasks
+                WHERE tasks.channel_id = ?
+                  AND COALESCE(tasks.status, 'new') IN ({placeholders})
+                  AND COALESCE(tasks.updated_at, tasks.created_at) >= ?
+                  AND (
+                    ? = ''
+                    OR COALESCE(tasks.requester_user_id, tasks.user_id, '') = ?
+                  )
+                ORDER BY COALESCE(tasks.updated_at, tasks.created_at) DESC, tasks.id DESC
+                LIMIT ?
+                """,
+                (channel_id, *statuses, recent_cutoff, requester_user_id, requester_user_id, limit),
+            ).fetchall()
+
+        cases: list[dict[str, Any]] = []
+        for row in rows:
+            classification = self.classification_from_task_row(row)
+            cases.append(
+                {
+                    "task_id": row["id"],
+                    "status": row["status"] or "new",
+                    "summary": row["summary"] or "",
+                    "public_request_text": row["public_request_text"] or row["requested_action"] or "",
+                    "execution_brief": row["execution_brief"] or "",
+                    "missing_information": coerce_string_list(classification.get("missing_information")),
+                    "recent_updates": self.task_context_additions_text(row["id"], limit=3),
+                }
+            )
+        return cases
+
+    def build_intent_prompt(
+        self,
+        *,
+        text: str,
+        sender_label: str,
+        conversation_label: str,
+        context_text: str,
+        case_memory: list[dict[str, Any]],
+        links_text: str,
+    ) -> str:
+        return f"""
+Sos el clasificador de intención de mensajes de trabajo de Ivan Rodríguez.
+
+Elegí exactamente una intención:
+- new_task: pedido nuevo que exige trabajo, producción, revisión o una acción verificable.
+- followup: agrega datos, corrige alcance o consulta el estado de una tarea ya abierta.
+- reply_only: pregunta, confirmación, opinión o dato breve que puede requerir respuesta pero no trabajo nuevo.
+- fyi: información sin pedido ni respuesta necesaria.
+
+Conversación: {conversation_label}
+Remitente: {sender_label}
+
+Contexto reciente de la conversación:
+{context_text or "Sin contexto reciente."}
+
+URLs detectadas:
+{links_text or "Sin URLs detectadas."}
+
+Casos abiertos estructurados del mismo remitente:
+{json.dumps(case_memory, ensure_ascii=False, indent=2) if case_memory else "[]"}
+
+Mensaje actual:
+{text}
+
+Reglas:
+- Decidí solo la intención; no redactes todavía la tarea.
+- Una pregunta no es automáticamente una tarea.
+- Un mensaje que completa o corrige un caso abierto es followup y debe indicar related_task_id.
+- No relaciones el mensaje por cercanía temporal solamente: debe coincidir el tema.
+- Si abre un trabajo distinto, es new_task aunque exista otro caso reciente.
+- confidence expresa seguridad semántica entre 0 y 1.
+- review_needed=true cuando hay dos interpretaciones razonables o no es seguro crear/asociar una tarea.
+- No inventes una relación con un task_id que no aparezca en la memoria.
+""".strip()
+
+    def normalize_intent_classification(
+        self,
+        intent: SlackIntentClassification,
+        *,
+        text: str,
+        case_memory: list[dict[str, Any]],
+    ) -> SlackIntentClassification:
+        case_ids = {int(case["task_id"]) for case in case_memory}
+        update: dict[str, Any] = {}
+
+        if starts_new_request(text):
+            update.update(intent="new_task", related_task_id=None)
+        elif looks_like_followup_message(text) and case_ids and intent.intent != "new_task":
+            update["intent"] = "followup"
+        elif looks_like_question_only_message(text) and not looks_like_work_request(text):
+            update.update(intent="reply_only", related_task_id=None)
+
+        normalized = intent.model_copy(update=update)
+        related_task_id = normalized.related_task_id
+        if related_task_id not in case_ids:
+            related_task_id = None
+        if normalized.intent == "followup" and related_task_id is None and len(case_ids) == 1:
+            related_task_id = next(iter(case_ids))
+
+        review_needed = normalized.review_needed or normalized.confidence < self.config.classification_auto_confidence
+        if normalized.intent == "followup" and related_task_id is None:
+            review_needed = True
+        return normalized.model_copy(
+            update={
+                "related_task_id": related_task_id,
+                "review_needed": review_needed,
+            }
+        )
+
+    def invoke_intent_classification(
+        self,
+        *,
+        text: str,
+        sender_label: str,
+        conversation_label: str,
+        context_text: str,
+        case_memory: list[dict[str, Any]],
+        links_text: str,
+    ) -> tuple[SlackIntentClassification, Optional[SlackClassification]]:
+        result = self.get_intent_classifier().invoke(
+            self.build_intent_prompt(
+                text=text,
+                sender_label=sender_label,
+                conversation_label=conversation_label,
+                context_text=context_text,
+                case_memory=case_memory,
+                links_text=links_text,
+            )
+        )
+        if isinstance(result, SlackClassification):
+            return classification_intent_from_task(result), result
+        intent = (
+            result
+            if isinstance(result, SlackIntentClassification)
+            else SlackIntentClassification.model_validate(result)
+        )
+        return intent, None
+
     def call_history(self, channel_id: str, oldest: str) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         cursor: Optional[str] = None
@@ -4686,7 +5652,7 @@ Reglas:
         return f"""
 Sos el asistente personal de trabajo de Ivan Rodríguez.
 
-Analizá este mensaje de Slack y devolvé una clasificación estructurada.
+El mensaje ya fue clasificado como una tarea nueva. Extraé y redactá la tarea estructurada.
 
 Datos:
 - Conversación: {conversation_label}
@@ -4704,8 +5670,7 @@ Mensaje:
 
 Reglas:
 - No inventes datos.
-- Si es un DM casual sin pedido concreto, is_actionable=false.
-- Si hay un pedido de trabajo o seguimiento, is_actionable=true.
+- Esta etapa solo redacta tareas nuevas: intent=new_task e is_actionable=true.
 - Identificá qué esperan que haga Ivan.
 - Si el mensaje pide armar, revisar, generar, exportar, validar o consultar un informe/reporte/dashboard usando links o datos de Salesforce, la categoría debe ser "salesforce".
 - Si hay URLs de Salesforce, agregá "salesforce" en external_systems.
@@ -4718,6 +5683,13 @@ Reglas:
 - Si no hay link de Salesforce pero el pedido menciona base de donantes, stock activo, datos personales y datos de donación, marcá needs_external_system=true y agregá "salesforce" a external_systems, salvo que el mensaje indique explícitamente otra fuente.
 {new_request_rule}
 - El campo requested_action debe quedar redactado para que otro agente pueda ejecutar la tarea sin leer todo el hilo.
+- summary debe ser un título operativo breve, empezar con un verbo en infinitivo y no incluir el nombre del remitente.
+- objective describe el resultado buscado; deliverable describe el artefacto o resultado verificable.
+- source_materials enumera links, archivos, reportes o fuentes mencionadas.
+- scope_filters enumera segmentos, campañas, estados, poblaciones, exclusiones y demás filtros.
+- time_period conserva literalmente el período o fecha de corte; dejalo vacío si no aparece.
+- required_fields enumera los campos de datos solicitados.
+- Evitá verbos vagos como "ver", "mirar" o "hacer". Convertí el pedido en una acción concreta sin inventar alcance.
 - En requested_action incluí qué hay que hacer, período temporal si aparece, segmentación solicitada, fuentes o campañas indicadas y campos requeridos.
 - Ejemplo de requested_action bueno: "Armar un informe de altas 2026 por campaña principal/campaña de origen para las campañas indicadas en Salesforce, incluyendo datos de la persona —nombre y apellido, fecha de nacimiento/edad, residencia— y datos de donación —fecha establecida, estado, monto, fecha de finalización y campaña—."
 - Si falta información para actuar, listala.
@@ -4817,12 +5789,8 @@ Reglas:
         message = state["message"]
         conversation = state["conversation"]
         context_text = ""
-        if state.get("relevant") and not starts_new_request(message.get("text", "")):
-            context_text = self.fetch_recent_context(
-                conversation["id"],
-                message["ts"],
-                thread_ts=message.get("thread_ts"),
-            )
+        if state.get("relevant"):
+            context_text = self.build_message_context(message=message, conversation=conversation)
         self.upsert_processed_relevance(
             channel_id=conversation["id"],
             message_ts=message["ts"],
@@ -4846,27 +5814,74 @@ Reglas:
             return state
 
         message_text = state["message"].get("text", "")
-        classification = self.invoke_classification(
+        channel_id = state["conversation"]["id"]
+        context_text = self.get_message_context(channel_id=channel_id, message_ts=state["message"]["ts"])
+        case_memory = self.fetch_structured_case_memory(
+            channel_id=channel_id,
+            requester_user_id=str(state["message"].get("user") or ""),
+        )
+        intent, preclassified = self.invoke_intent_classification(
             text=message_text,
             sender_label=state["sender_label"],
             conversation_label=state["conversation_label"],
-            relevance_reason=state.get("relevance_reason", ""),
-            context_text=self.get_message_context(
-                channel_id=state["conversation"]["id"],
-                message_ts=state["message"]["ts"],
-            ),
+            context_text=context_text,
+            case_memory=case_memory,
             links_text=self.get_message_links_context(
-                channel_id=state["conversation"]["id"],
+                channel_id=channel_id,
                 message_ts=state["message"]["ts"],
             ),
         )
-        classification = normalize_classification_with_rules(
-            classification,
+        intent = self.normalize_intent_classification(
+            intent,
             text=message_text,
-            message_links=state.get("message_links", []),
+            case_memory=case_memory,
         )
+
+        if intent.intent == "new_task" and not intent.review_needed:
+            classification = preclassified or self.invoke_classification(
+                text=message_text,
+                sender_label=state["sender_label"],
+                conversation_label=state["conversation_label"],
+                relevance_reason=state.get("relevance_reason", ""),
+                context_text=context_text,
+                links_text=self.get_message_links_context(
+                    channel_id=channel_id,
+                    message_ts=state["message"]["ts"],
+                ),
+            )
+            classification = normalize_classification_with_rules(
+                classification,
+                text=message_text,
+                message_links=state.get("message_links", []),
+            )
+            classification = refine_classification_for_conversation(
+                classification,
+                text=message_text,
+                context_text=context_text,
+            )
+            if classification.is_actionable:
+                classification = normalize_task_classification(
+                    classification,
+                    raw_text=message_text,
+                    confidence=intent.confidence,
+                )
+            else:
+                intent = classification_intent_from_task(classification).model_copy(
+                    update={"confidence": intent.confidence}
+                )
+                classification = classification.model_copy(
+                    update={
+                        "intent": intent.intent,
+                        "confidence": intent.confidence,
+                        "review_needed": intent.review_needed,
+                    }
+                )
+        else:
+            classification = classification_from_intent(intent)
         return {
             **state,
+            "intent_classification": intent,
+            "related_task_id": intent.related_task_id,
             "classification": classification,
         }
 
@@ -4895,13 +5910,26 @@ Reglas:
         message = state["message"]
         conversation = state["conversation"]
 
+        if classification.intent == "followup" and state.get("related_task_id"):
+            task_row = self.get_task_by_id(int(state["related_task_id"]))
+            if task_row:
+                self.add_context_to_task(
+                    task_row,
+                    message=message,
+                    conversation=conversation,
+                    sender_label=state["sender_label"],
+                    conversation_label=state["conversation_label"],
+                )
+                return state
+
         self.mark_processed_done(
             channel_id=conversation["id"],
             message_ts=message["ts"],
             classification=classification,
+            status="review_needed" if classification.review_needed else "done",
         )
 
-        if classification.is_actionable:
+        if classification.is_actionable and not classification.review_needed:
             thread_ts = self.message_thread_ts(message)
             case_key = self.build_case_key(conversation["id"], thread_ts)
             inserted = self.save_task(
@@ -4920,7 +5948,8 @@ Reglas:
                 task_row = self.get_task_row(conversation["id"], message["ts"])
                 if task_row:
                     self.assign_visual_attachments_to_task(conversation["id"], message["ts"], task_row["id"])
-                    self.send_task_acknowledgement(task_row["id"])
+                    if self.should_send_intake_feedback():
+                        self.send_task_acknowledgement(task_row["id"])
                 if self.config.trello_enabled and self.config.trello_auto_create:
                     self.sync_task_to_trello_by_message(conversation["id"], message["ts"])
 
@@ -5038,25 +6067,82 @@ Reglas:
 
         for row in retry_rows:
             try:
-                classification = self.invoke_classification(
-                    text=row["raw_text"] or "",
+                raw_text = row["raw_text"] or ""
+                case_memory = self.fetch_structured_case_memory(
+                    channel_id=row["channel_id"],
+                    requester_user_id=row["user_id"] or "",
+                )
+                intent, preclassified = self.invoke_intent_classification(
+                    text=raw_text,
                     sender_label=row["sender_label"] or "unknown",
                     conversation_label=row["conversation_label"] or row["channel_id"],
-                    relevance_reason=row["relevance_reason"] or "Mensaje previamente marcado como relevante.",
                     context_text=row["context_text"] or "",
+                    case_memory=case_memory,
                     links_text=self.get_message_links_context(row["channel_id"], row["message_ts"]),
                 )
-                classification = normalize_classification_with_rules(
-                    classification,
-                    text=row["raw_text"] or "",
-                    message_links=self.get_message_link_objects(row["channel_id"], row["message_ts"]),
+                intent = self.normalize_intent_classification(
+                    intent,
+                    text=raw_text,
+                    case_memory=case_memory,
                 )
+                if intent.intent == "new_task" and not intent.review_needed:
+                    classification = preclassified or self.invoke_classification(
+                        text=raw_text,
+                        sender_label=row["sender_label"] or "unknown",
+                        conversation_label=row["conversation_label"] or row["channel_id"],
+                        relevance_reason=row["relevance_reason"] or "Mensaje previamente marcado como relevante.",
+                        context_text=row["context_text"] or "",
+                        links_text=self.get_message_links_context(row["channel_id"], row["message_ts"]),
+                    )
+                    classification = normalize_classification_with_rules(
+                        classification,
+                        text=raw_text,
+                        message_links=self.get_message_link_objects(row["channel_id"], row["message_ts"]),
+                    )
+                    classification = refine_classification_for_conversation(
+                        classification,
+                        text=raw_text,
+                        context_text=row["context_text"] or "",
+                    )
+                    if classification.is_actionable:
+                        classification = normalize_task_classification(
+                            classification,
+                            raw_text=raw_text,
+                            confidence=intent.confidence,
+                        )
+                    else:
+                        intent = classification_intent_from_task(classification).model_copy(
+                            update={"confidence": intent.confidence}
+                        )
+                        classification = classification.model_copy(
+                            update={"intent": intent.intent, "confidence": intent.confidence}
+                        )
+                else:
+                    classification = classification_from_intent(intent)
+
+                if intent.intent == "followup" and intent.related_task_id and not intent.review_needed:
+                    task_row = self.get_task_by_id(intent.related_task_id)
+                    if task_row:
+                        conversation = {
+                            "id": row["channel_id"],
+                            "is_im": str(row["channel_id"]).startswith("D"),
+                        }
+                        self.add_context_to_task(
+                            task_row,
+                            message={"ts": row["message_ts"], "text": raw_text, "user": row["user_id"]},
+                            conversation=conversation,
+                            sender_label=row["sender_label"] or "unknown",
+                            conversation_label=row["conversation_label"] or row["channel_id"],
+                        )
+                        recovered += 1
+                        continue
                 self.mark_processed_done(
                     channel_id=row["channel_id"],
                     message_ts=row["message_ts"],
                     classification=classification,
+                    status="review_needed" if classification.review_needed else "done",
                 )
-                if classification.is_actionable:
+                if classification.is_actionable and not classification.review_needed:
                     thread_ts = row["message_ts"]
                     inserted = self.save_task(
                         channel_id=row["channel_id"],
@@ -5074,7 +6160,8 @@ Reglas:
                         task_row = self.get_task_row(row["channel_id"], row["message_ts"])
                         if task_row:
                             self.assign_visual_attachments_to_task(row["channel_id"], row["message_ts"], task_row["id"])
-                            self.send_task_acknowledgement(task_row["id"])
+                            if self.should_send_intake_feedback():
+                                self.send_task_acknowledgement(task_row["id"])
                         if self.config.trello_enabled and self.config.trello_auto_create:
                             self.sync_task_to_trello_by_message(row["channel_id"], row["message_ts"])
                 recovered += 1
@@ -5301,6 +6388,28 @@ Reglas:
         if len(tasks) > limit:
             lines.append(f"- Y {len(tasks) - limit} más.")
 
+    def fetch_classification_reviews(self, limit: int = 50) -> list[sqlite3.Row]:
+        with self.db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT channel_id,
+                       message_ts,
+                       sender_label,
+                       conversation_label,
+                       raw_text,
+                       intent,
+                       confidence,
+                       relevance_reason,
+                       classification_json
+                FROM processed_messages
+                WHERE classification_status = 'review_needed'
+                ORDER BY processed_at ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return list(rows)
+
     def build_brief(
         self,
         *,
@@ -5316,6 +6425,7 @@ Reglas:
         now_local = now_utc.astimezone()
         section_limit = max(1, section_limit)
         rows = self.fetch_open_tasks_for_brief(limit=max(scan_limit, section_limit))
+        classification_reviews = self.fetch_classification_reviews(limit=max(scan_limit, section_limit))
         tasks = [
             task
             for task in (self.task_brief_info(row, now_local) for row in rows)
@@ -5371,6 +6481,7 @@ Reglas:
             "Resumen del agente",
             f"Fecha local: {now_local.strftime('%Y-%m-%d %H:%M')}",
             f"Tareas abiertas: {len(tasks)}",
+            f"Clasificaciones para revisar: {len(classification_reviews)}",
         ]
         if tasks:
             counters = [
@@ -5409,6 +6520,19 @@ Reglas:
             empty_text="No hay tareas con información faltante.",
             limit=section_limit,
         )
+        lines.append("")
+        lines.append("Clasificaciones ambiguas")
+        if not classification_reviews:
+            lines.append("- No hay mensajes en la zona gris.")
+        else:
+            for review in classification_reviews[:section_limit]:
+                confidence = float(review["confidence"] or 0.0)
+                lines.append(
+                    f"- {review['intent'] or 'sin intención'} ({confidence:.0%}) de "
+                    f"{review['sender_label'] or 'unknown'} en "
+                    f"{review['conversation_label'] or review['channel_id']}: "
+                    f"{compact_text(review['raw_text'] or '', 150)}"
+                )
         self.add_brief_section(
             lines,
             "Necesitan respuesta",
@@ -5964,7 +7088,10 @@ Reglas:
     def install_autostart(self) -> None:
         artifacts = install_launch_agents(
             project_dir=Path(__file__).resolve().parent,
+            env_file=Path(__file__).resolve().parent / ".env",
             ollama_base_url=self.config.ollama_base_url,
+            ollama_auth_token=self.config.ollama_auth_token,
+            manage_ollama=self.config.ollama_managed_locally,
             sync_worker_seconds=self.config.sync_worker_seconds,
             sync_waiting_enabled=self.config.sync_waiting_enabled,
             sync_trello_done_enabled=self.config.sync_trello_done_enabled,
@@ -5972,7 +7099,13 @@ Reglas:
             final_reply_mode=self.config.final_reply_mode,
         )
         print("[green]Autostart instalado.[/green]")
-        print(f"Ollama plist: {artifacts.ollama_plist}")
+        if self.config.ollama_managed_locally:
+            print(f"Ollama plist: {artifacts.ollama_plist}")
+        else:
+            print(
+                f"Ollama remoto: {self.config.ollama_base_url} "
+                f"(auth={'si' if bool(self.config.ollama_auth_token) else 'no'})"
+            )
         print(f"Agente plist: {artifacts.agent_plist}")
         print(f"Sync plist: {artifacts.sync_plist}")
         print(f"Logs: {artifacts.log_dir}")
@@ -6005,7 +7138,8 @@ Reglas:
         if self.config.model_provider == "ollama":
             hint_level, hint_text = local_model_fit_hint(self.config.ollama_model)
             color = {"ok": "green", "caution": "yellow", "warning": "red"}.get(hint_level, "white")
-            print(f"[{color}]Modelo local: {self.config.ollama_model}[/{color}]")
+            print(f"[{color}]Modelo Ollama: {self.config.ollama_model}[/{color}]")
+            print(f"[{color}]Endpoint:[/{color}] {self.config.ollama_base_url}")
             print(f"[{color}]Consejo:[/{color}] {hint_text}")
         else:
             print(f"Modelo remoto: {self.config.groq_model}")
@@ -6064,8 +7198,9 @@ Reglas:
             print(f"[red]Inferencia del proveedor falló:[/red] {exc}")
             if self.config.model_provider == "ollama":
                 print(
-                    "[yellow]Si estás usando Ollama, verificá `ollama serve` y que el modelo "
-                    f"`{self.config.ollama_model}` esté descargado.[/yellow]"
+                    "[yellow]Si estás usando Ollama, verificá la URL configurada, el token Bearer "
+                    "si aplica y que el modelo "
+                    f"`{self.config.ollama_model}` esté disponible en el servidor remoto.[/yellow]"
                 )
 
         if self.config.local_whisper_enabled:
